@@ -25,6 +25,7 @@ DIRS-$(CONFIG_VHOST) += vhost
 DIRS-y += spdk_dd
 endif
 DIRS-$(CONFIG_FIO_PLUGIN) += fio
+DIRS-y += nvmf_iaa
 
 .PHONY: all clean $(DIRS-y)
 

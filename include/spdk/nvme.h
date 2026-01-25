@@ -4795,6 +4795,16 @@ void spdk_nvme_transport_get_opts(struct spdk_nvme_transport_opts *opts, size_t 
  */
 int spdk_nvme_transport_set_opts(const struct spdk_nvme_transport_opts *opts, size_t opts_size);
 
+/**
+ * Get the IBV Protection Domain (PD) associated with an NVMe RDMA QPair.
+ * This is useful for registering external memory to be accessible by the NVMe connection.
+ *
+ * \param qpair NVMe I/O Queue Pair.
+ *
+ * \return Pointer to ibv_pd on success, or NULL if qpair is not RDMA or otherwise invalid.
+ */
+struct ibv_pd *spdk_nvme_rdma_get_ibv_pd(struct spdk_nvme_qpair *qpair);
+
 #ifdef __cplusplus
 }
 #endif

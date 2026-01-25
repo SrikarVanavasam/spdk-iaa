@@ -397,6 +397,9 @@ struct spdk_nvmf_rdma_qpair {
 	/* Save the listen_trid by rqpair itself instead of get it from listen_id
 	 * everytime, because the listen_id may be freed before the qpair is destroyed */
 	struct spdk_nvme_transport_id		listen_trid;
+
+    /* Cache for Redirection Peer */
+    struct spdk_nvmf_rdma_qpair *peer_qpair;
 };
 
 struct spdk_nvmf_rdma_poller_stat {
@@ -1113,11 +1116,60 @@ request_transfer_in(struct spdk_nvmf_request *req)
 	assert(req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER);
 	assert(rdma_req != NULL);
 
-	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, rdma_req->transfer_wr)) {
-		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+	struct spdk_rdma_provider_qp *submit_qp = rqpair->rdma_qp;
+	struct spdk_nvmf_rdma_qpair *submit_qpair = rqpair;
+
+    // Log CDW15 to verify it is 0 for standard traffic
+    if (rqpair->qpair.qid != 0) {
+        SPDK_NOTICELOG("Transfer In: QID %u, OPC %u, CDW15 %u\n", rqpair->qpair.qid, req->cmd->nvme_cmd.opc, req->cmd->nvme_cmd.cdw15);
+    }
+
+	// HACK: Redirect Writes (Target Reading) to the "Other" QPair (Client)
+	// cdw15 = CNTLID
+	uint16_t redirect_cntlid = 0;
+
+	if (rqpair->qpair.qid != 0 && (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE || req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ)) {
+		redirect_cntlid = req->cmd->nvme_cmd.cdw15 & 0xFFFF;
+	}
+
+	// Lookup Peer based on CNTLID (Unique per Connection)
+	if (redirect_cntlid > 0) {
+        SPDK_NOTICELOG("Redirecting Transfer In (RDMA Read) for Origin QID %u to Peer CNTLID %u\n", 
+			rqpair->qpair.qid, redirect_cntlid);
+		
+        // Lazy Lookup & Cache
+		if (!rqpair->peer_qpair || !rqpair->peer_qpair->qpair.ctrlr || rqpair->peer_qpair->qpair.ctrlr->cntlid != redirect_cntlid) {
+			struct spdk_nvmf_rdma_qpair *other_qpair;
+			RB_FOREACH(other_qpair, qpairs_tree, &rqpair->poller->qpairs) {
+				if (other_qpair->qpair.qid != 0 && other_qpair->qpair.ctrlr && other_qpair->qpair.ctrlr->cntlid == redirect_cntlid) {
+					rqpair->peer_qpair = other_qpair;
+					break; 
+				}
+			}
+		}
+
+		if (rqpair->peer_qpair) {
+            // Safety Check: Same Device = Same PD = LKeys Valid
+            if (rqpair->device != rqpair->peer_qpair->device) {
+                SPDK_ERRLOG("Cannot redirect to different RDMA Device! PD Mismatch.\n");
+            } else {
+                if (rqpair->poller != rqpair->peer_qpair->poller) {
+                    SPDK_ERRLOG("CRITICAL WARNING: SNIC and Client are on DIFFERENT Pollers! (Redirection requires same core)\n");
+                }
+
+                submit_qpair = rqpair->peer_qpair;
+                submit_qp = rqpair->peer_qpair->rdma_qp;
+            }
+		} else {
+			SPDK_WARNLOG("Redirect CNTLID %u not found (Peer is NULL)!\n", redirect_cntlid);
+		}
+	}
+
+	if (spdk_rdma_provider_qp_queue_send_wrs(submit_qp, rdma_req->transfer_wr)) {
+		STAILQ_INSERT_TAIL(&submit_qpair->poller->qpairs_pending_send, submit_qpair, send_link);
 	}
 	if (rtransport->rdma_opts.no_wr_batching) {
-		_poller_submit_sends(rtransport, rqpair->poller);
+		_poller_submit_sends(rtransport, submit_qpair->poller);
 	}
 
 	assert(rqpair->current_read_depth + rdma_req->num_outstanding_data_wr <= rqpair->max_read_depth);
@@ -1208,6 +1260,8 @@ request_transfer_out(struct spdk_nvmf_request *req, int *data_posted)
 	 */
 	first = &rdma_req->rsp.wr;
 
+    bool is_redirected = false;
+
 	if (spdk_unlikely(spdk_nvme_cpl_is_error(rsp))) {
 		/* On failure, data was not read from the controller. So clear the
 		 * number of outstanding data WRs to zero.
@@ -1217,12 +1271,68 @@ request_transfer_out(struct spdk_nvmf_request *req, int *data_posted)
 		first = rdma_req->transfer_wr;
 		*data_posted = 1;
 		num_outstanding_data_wr = rdma_req->num_outstanding_data_wr;
+
+        // REDIRECTION: CNTLID Logic
+        uint16_t redirect_cntlid = 0;
+        if (rqpair->qpair.qid != 0 && (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE || req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ)) {
+            redirect_cntlid = req->cmd->nvme_cmd.cdw15 & 0xFFFF;
+        }
+
+        if (redirect_cntlid > 0) {
+            // Lazy Lookup
+            if (!rqpair->peer_qpair || !rqpair->peer_qpair->qpair.ctrlr || rqpair->peer_qpair->qpair.ctrlr->cntlid != redirect_cntlid) {
+                struct spdk_nvmf_rdma_qpair *other_qpair;
+                RB_FOREACH(other_qpair, qpairs_tree, &rqpair->poller->qpairs) {
+                    if (other_qpair->qpair.qid != 0 && other_qpair->qpair.ctrlr && other_qpair->qpair.ctrlr->cntlid == redirect_cntlid) {
+                        rqpair->peer_qpair = other_qpair;
+                        break; 
+                    }
+                }
+            }
+
+            if (rqpair->peer_qpair) {
+                // Safety Check: Shared PD
+                if (rqpair->device != rqpair->peer_qpair->device) {
+                    SPDK_ERRLOG("Cannot redirect to different RDMA Device! PD Mismatch.\n");
+                } else {
+                    SPDK_NOTICELOG("Redirecting Transfer Out: Data to Peer CNTLID %u, Resp to Origin\n", redirect_cntlid);
+                    is_redirected = true;
+
+                    // 1. Break the chain
+                    struct ibv_send_wr *last_data = first;
+                    while (last_data->next && last_data->next != &rdma_req->rsp.wr) {
+                        last_data = last_data->next;
+                    }
+                    last_data->next = NULL; 
+                    last_data->send_flags |= IBV_SEND_SIGNALED; 
+
+                    // 2. Submit Data to PEER
+                    if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->peer_qpair->rdma_qp, first)) {
+                        STAILQ_INSERT_TAIL(&rqpair->peer_qpair->poller->qpairs_pending_send, rqpair->peer_qpair, send_link);
+                    }
+
+                    // 3. Submit Response to ORIGIN
+                    if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, &rdma_req->rsp.wr)) {
+                        STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+                    }
+                }
+            } else {
+                SPDK_WARNLOG("Redirect CNTLID %u not found\n", redirect_cntlid);
+            }
+        }
 	}
-	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, first)) {
-		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
-	}
+
+    if (!is_redirected) {
+        if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, first)) {
+            STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+        }
+    }
+
 	if (rtransport->rdma_opts.no_wr_batching) {
 		_poller_submit_sends(rtransport, rqpair->poller);
+        if (is_redirected && rqpair->peer_qpair) {
+             _poller_submit_sends(rtransport, rqpair->peer_qpair->poller);
+        }
 	}
 
 	/* +1 for the rsp wr */
@@ -1325,6 +1435,9 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 	port = event->listen_id->context;
 	SPDK_DEBUGLOG(rdma, "Listen Id was %p with verbs %p. ListenAddr: %p\n",
 		      event->listen_id, event->listen_id->verbs, port);
+
+    SPDK_NOTICELOG("RDMA Connect Request: QID %u, IRD %u, ORS %u\n", 
+        private_data->qid, rdma_param->initiator_depth, rdma_param->responder_resources);
 
 	/* Figure out the supported queue depth. This is a multi-step process
 	 * that takes into account hardware maximums, host provided values,

@@ -1487,6 +1487,12 @@ nvme_rdma_build_null_request(struct spdk_nvme_rdma_req *rdma_req)
 	/* The RDMA SGL needs one element describing the NVMe command. */
 	rdma_req->send_wr.num_sge = 1;
 
+    // Passthrough Hack: If user provided a Keyed SGL, don't clobber it with zeros
+    if (req->cmd.dptr.sgl1.keyed.type == SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK &&
+        req->cmd.dptr.sgl1.keyed.subtype == SPDK_NVME_SGL_SUBTYPE_ADDRESS) {
+        return 0;
+    }
+
 	req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
 	req->cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
 	req->cmd.dptr.sgl1.keyed.length = 0;
@@ -3740,3 +3746,21 @@ const struct spdk_nvme_transport_ops rdma_ops = {
 };
 
 SPDK_NVME_TRANSPORT_REGISTER(rdma, &rdma_ops);
+
+struct ibv_pd *
+spdk_nvme_rdma_get_ibv_pd(struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_rdma_qpair *rqpair;
+
+	if (!qpair || qpair->trtype != SPDK_NVME_TRANSPORT_RDMA) {
+		return NULL;
+	}
+
+	rqpair = SPDK_CONTAINEROF(qpair, struct nvme_rdma_qpair, qpair);
+
+	if (!rqpair->rdma_qp || !rqpair->rdma_qp->qp) {
+		return NULL;
+	}
+
+	return rqpair->rdma_qp->qp->pd;
+}
