@@ -31,6 +31,16 @@ The system consists of two main components:
         *   Upon NVMe completion, SNIC initiates **IAA Memmove** (future: Decompression) to copy data from Staging Buffer to Host Memory (Dest).
 4.  **Completion**: SNIC writes a Completion Record back to the Host's completion queue via RDMA Write.
 
+## IAA Setup
+1. Clone this repo: https://github.com/SrikarVanavasam/rdma_idxd
+2. Run ./idxd/reload.sh
+3. Run  ./configs/1n4d8e1w-d-n1.sh
+## Running example
+
+1. Target: ./app/nvmf_iaa/start_traget.sh
+2. SNIC: sudo ./build/bin/snic -r "trtype:RDMA adrfam:IPv4 traddr:192.168.200.20 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1" 
+3. Client: sudo ./build/bin/client 192.168.200.11 192.168.200.20 4420
+
 ## Future Roadmap
 
 The current implementation establishes the control plane and data path infrastructure. The following key optimizations are planned:
