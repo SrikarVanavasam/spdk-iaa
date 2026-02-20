@@ -207,7 +207,26 @@ submit_iaa_async(int slot_idx) {
 
     // Populate Descriptor 
     memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
-    g_ctx.desc->opcode = IAX_OPCODE_MEMMOVE;
+    //g_ctx.desc->opcode = IAX_OPCODE_MEMMOVE;
+
+    // [IAA_COMP_UPDATE] WRITE(op==1): use COMPRESS first; keep READ path as MEMMOVE for now
+    g_ctx.desc->opcode = (areq->op == 1) ? IAX_OPCODE_COMPRESS : IAX_OPCODE_MEMMOVE;
+    g_ctx.desc->src1_size = areq->len;
+
+    // [IAA_COMP_UPDATE] COMPRESS requires max_dst_size (capacity of output buffer).
+    // We compress into per-slot scratch buffer (MAX_DATA_SIZE bytes).
+    if (areq->op == 1) {
+        g_ctx.desc->max_dst_size = MAX_DATA_SIZE;
+
+        // Minimal bring-up flags: start with 0. You'll tune compr_flags/filter_flags later.
+        g_ctx.desc->compr_flags = 0;
+        g_ctx.desc->filter_flags = 0;
+
+        // No AECS for bring-up
+        g_ctx.desc->src2_addr = 0;
+        g_ctx.desc->src2_size = 0;
+    }
+
     g_ctx.desc->flags = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
     
     uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
@@ -453,8 +472,13 @@ check_messages(void *arg) {
                         // DONE!
                         // Handle Completion
                         if (areq->op == 1) {
-                            // Write: IAA Done -> Submit NVMe
-                             submit_nvme_io(areq, 1); // 1 = Write
+                            // // Write: IAA Done -> Submit NVMe
+                            //  submit_nvme_io(areq, 1); // 1 = Write
+
+                            // [IAA_COMP_UPDATE] WRITE path is COMPRESS-only for now (no NVMe yet).
+                            // Host will verify by reading scratch(slot) + output_size in completion record.
+                            submit_completion(0, areq->req_id);
+                            areq->state = REQ_FREE;
                         } else {
                             // Read: IAA (Decomp) Done -> Complete
                             submit_completion(0, areq->req_id);
