@@ -31,4 +31,7 @@ int snic_client_read(struct snic_client_ctx *ctx, void *dst_buf, uint64_t lba, u
 // Returns 1 if completion found (populating req_id and status), 0 if empty.
 int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status);
 
+void *snic_client_get_scratch_base(struct snic_client_ctx *ctx);
+void *snic_client_get_comp_base(struct snic_client_ctx *ctx);
+
 #endif // SNIC_CLIENT_H

@@ -34,36 +34,55 @@ int main(int argc, char *argv[]) {
     printf("Submitted Req %d (Write). Waiting for completion...\n", req1);
 
     // Poll for Write
+    // while(1) {
+        //     int cid;
+        //     int status;
+        //     if (snic_client_poll(ctx, &cid, &status)) {
+            //         printf("Completion Received! ID: %u, Status: %d\n", cid, status);
+            //         if (cid == req1) break;
+            
+            //         // dump compressed data
+            //         uint8_t *comp_ptr =
+            //             (uint8_t *)((uint8_t*)ctx->scratch_buf + (uint64_t)slot * MAX_DATA_SIZE);
+            //         uint32_t comp_len = cr->output_size;
+            
+            //         printf("Compressed output: first 16 bytes:\n");
+            //         for (int i = 0; i < 16 && i < (int)comp_len; i++) printf("%02x ", comp_ptr[i]);
+            //         printf("\n");
+            
+            //         // [UPDATE_END]
+            //     }
+            // }
+            
     int slot = 2;   // [IAA_COMP_UPDATE] Both write/read have slot_idx=2
-    while(1) {
+    while (1) {
         int cid;
         int status;
         if (snic_client_poll(ctx, &cid, &status)) {
             printf("Completion Received! ID: %u, Status: %d\n", cid, status);
-            // if (cid == req1) break;
-            // [IAA_COMP_UPDATE]
+
             if (cid == req1) {
-                // ===== dump IAA completion record for this slot =====
                 struct iax_completion_record *cr =
-                    (struct iax_completion_record *)((uint8_t*)ctx->comp_buf
-                        + slot * sizeof(struct iax_completion_record));
+                    (struct iax_completion_record *)((uint8_t *)snic_client_get_comp_base(ctx)
+                        + (size_t)slot * sizeof(struct iax_completion_record));
 
                 printf("IAA CR: status=0x%02x error=0x%02x output_size=%u bytes_completed=%u invalid_flags=0x%08x\n",
                     cr->status, cr->error_code, cr->output_size, cr->bytes_completed, cr->invalid_flags);
-                // ==============================================================
+
+                uint8_t *comp_ptr =
+                    (uint8_t *)((uint8_t *)snic_client_get_scratch_base(ctx)
+                        + (size_t)slot * (size_t)MAX_DATA_SIZE);
+
+                uint32_t comp_len = cr->output_size;
+
+                printf("Compressed output: first 16 bytes:\n");
+                for (int i = 0; i < 16 && i < (int)comp_len; i++) {
+                    printf("%02x ", comp_ptr[i]);
+                }
+                printf("\n");
+
                 break;
             }
-            
-            // dump compressed data
-            uint8_t *comp_ptr =
-                (uint8_t *)((uint8_t*)ctx->scratch_buf + (uint64_t)slot * MAX_DATA_SIZE);
-            uint32_t comp_len = cr->output_size;
-
-            printf("Compressed output: first 16 bytes:\n");
-            for (int i = 0; i < 16 && i < (int)comp_len; i++) printf("%02x ", comp_ptr[i]);
-            printf("\n");
-
-            // [UPDATE_END]
         }
     }
 

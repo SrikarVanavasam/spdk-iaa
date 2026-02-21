@@ -354,3 +354,6 @@ int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status)
     
     return 0;
 }
+
+void *snic_client_get_scratch_base(struct snic_client_ctx *ctx) { return ctx->scratch_buf; }
+void *snic_client_get_comp_base(struct snic_client_ctx *ctx) { return ctx->comp_buf; }
