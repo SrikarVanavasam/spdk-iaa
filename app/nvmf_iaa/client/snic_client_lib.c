@@ -57,6 +57,69 @@ static void die(const char *reason) {
   exit(EXIT_FAILURE);
 }
 
+static const char *iax_status_str(uint8_t st) {
+    switch (st) {
+        case IAX_COMP_NONE: return "NONE";
+        case IAX_COMP_SUCCESS: return "SUCCESS";
+        case IAX_COMP_PAGE_FAULT_IR: return "PAGE_FAULT_IR";
+        case IAX_COMP_ANALYTICS_ERROR: return "ANALYTICS_ERROR";
+        case IAX_COMP_OUTBUF_OVERFLOW: return "OUTBUF_OVERFLOW";
+        case IAX_COMP_BAD_OPCODE: return "BAD_OPCODE";
+        case IAX_COMP_INVALID_FLAGS: return "INVALID_FLAGS";
+        case IAX_COMP_NOZERO_RESERVE: return "NOZERO_RESERVE";
+        case IAX_COMP_INVALID_SIZE: return "INVALID_SIZE";
+        case IAX_COMP_OVERLAP_BUFFERS: return "OVERLAP_BUFFERS";
+        case IAX_COMP_INT_HANDLE_INVAL: return "INT_HANDLE_INVAL";
+        case IAX_COMP_CRA_XLAT: return "CRA_XLAT";
+        case IAX_COMP_CRA_ALIGN: return "CRA_ALIGN";
+        case IAX_COMP_ADDR_ALIGN: return "ADDR_ALIGN";
+        case IAX_COMP_PRIV_BAD: return "PRIV_BAD";
+        case IAX_COMP_TRAFFIC_CLASS_CONF: return "TRAFFIC_CLASS_CONF";
+        case IAX_COMP_PFAULT_RDBA: return "PFAULT_RDBA";
+        case IAX_COMP_HW_ERR1: return "HW_ERR1";
+        case IAX_COMP_HW_ERR_DRB: return "HW_ERR_DRB";
+        case IAX_COMP_TRANSLATION_FAIL: return "TRANSLATION_FAIL";
+        case IAX_COMP_PRS_TIMEOUT: return "PRS_TIMEOUT";
+        case IAX_COMP_WATCHDOG: return "WATCHDOG";
+        case IAX_COMP_INVALID_COMP_FLAG: return "INVALID_COMP_FLAG";
+        case IAX_COMP_INVALID_FILTER_FLAG: return "INVALID_FILTER_FLAG";
+        case IAX_COMP_INVALID_INPUT_SIZE: return "INVALID_INPUT_SIZE";
+        case IAX_COMP_INVALID_NUM_ELEMS: return "INVALID_NUM_ELEMS";
+        case IAX_COMP_INVALID_SRC1_WIDTH: return "INVALID_SRC1_WIDTH";
+        case IAX_COMP_INVALID_INVERT_OUT: return "INVALID_INVERT_OUT";
+        default: return "UNKNOWN";
+    }
+}
+
+static void dump_iax_cr(const struct iax_completion_record *cr, uint32_t slot) {
+    printf("[IAA CR][slot=%u]\n", slot);
+    printf("  status          = 0x%02x (%s)\n", cr->status, iax_status_str(cr->status));
+    printf("  error_code      = 0x%02x\n", cr->error_code);
+    printf("  fault_info      = 0x%02x\n", cr->fault_info);
+    printf("  bytes_completed = %u\n", cr->bytes_completed);
+    printf("  fault_addr      = 0x%016llx\n", (unsigned long long)cr->fault_addr);
+    printf("  invalid_flags   = 0x%08x\n", cr->invalid_flags);
+    printf("  output_size     = %u\n", cr->output_size);
+    printf("  output_bits     = %u\n", cr->output_bits);
+    printf("  xor_csum        = 0x%04x\n", cr->xor_csum);
+    printf("  crc             = 0x%08x\n", cr->crc);
+    printf("  min             = %u\n", cr->min);
+    printf("  max             = %u\n", cr->max);
+    printf("  sum             = %u\n", cr->sum);
+}
+
+static void dump_iax_cr_raw(const struct iax_completion_record *cr, uint32_t slot) {
+    const uint8_t *p = (const uint8_t *)cr;
+    size_t len = sizeof(*cr);
+
+    printf("[IAA CR RAW][slot=%u] %zu bytes\n", slot, len);
+    for (size_t i = 0; i < len; i++) {
+        if (i % 16 == 0) printf("  %04zx: ", i);
+        printf("%02x ", p[i]);
+        if (i % 16 == 15 || i == len - 1) printf("\n");
+    }
+}
+
 // -----------------------------------------------------------------------------
 // SNIC Connection (Raw RDMA)
 // -----------------------------------------------------------------------------
@@ -254,10 +317,18 @@ struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target
     memset(ctx->cq_buf, 0, sizeof(struct snic_completion) * CQ_SIZE);
     ctx->mr_cq = ibv_reg_mr(ctx->pd, ctx->cq_buf, sizeof(struct snic_completion) * CQ_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 
-    // Parallel IAA Completion Buffers (one per slot)
-    if (posix_memalign((void**)&ctx->comp_buf, 64, sizeof(struct iax_completion_record) * CQ_SIZE)) die("comp");
-    ctx->mr_comp = ibv_reg_mr(ctx->pd, ctx->comp_buf, sizeof(struct iax_completion_record) * CQ_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    // // Parallel IAA Completion Buffers (one per slot)
+    // if (posix_memalign((void**)&ctx->comp_buf, 64, sizeof(struct iax_completion_record) * CQ_SIZE)) die("comp");
+    // ctx->mr_comp = ibv_reg_mr(ctx->pd, ctx->comp_buf, sizeof(struct iax_completion_record) * CQ_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
 
+    printf("[Init] Cleaning IAA Completion Buffer\n");
+    if (posix_memalign((void**)&ctx->comp_buf, 64, sizeof(struct iax_completion_record) * CQ_SIZE)) die("comp");
+    memset(ctx->comp_buf, 0, sizeof(struct iax_completion_record) * CQ_SIZE);
+    ctx->mr_comp = ibv_reg_mr(ctx->pd, ctx->comp_buf,
+                            sizeof(struct iax_completion_record) * CQ_SIZE,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_comp) die("ibv_reg_mr comp");
+        
     printf("[Init] Mapping IAA Portal at %s...\n", wq_path);
     int fd = open(wq_path, O_RDWR);
     if (fd < 0) die("open wq");
@@ -327,7 +398,34 @@ int snic_client_read(struct snic_client_ctx *ctx, void *dst_buf, uint64_t lba, u
     return submit_req(ctx, SNIC_OP_READ, dst_buf, lba, len, req_id);
 }
 
-// API: Poll
+// // API: Poll
+// int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status) {
+//     uint32_t idx = ctx->cq_head % CQ_SIZE;
+//     volatile struct snic_completion *cump = &ctx->cq_buf[idx];
+
+//     // Check Status in Ring Buffer (Status 0 = Empty, 1/-1 = Valid)
+//     if (cump->status != 0) {
+//         *req_id = cump->req_id;
+//         *status = cump->status;
+        
+//         // Clear slot for next wrap
+//         cump->status = 0;
+        
+//         // Advance Head
+//         ctx->cq_head++;
+        
+//         // Optional: Trigger SPDK completions if needed to keep connection alive/heartbeats?
+//         // spdk_nvme_qpair_process_completions(ctx->nvme_qpair, 0); 
+
+//         return 1; // Completed
+//     }
+    
+//     // Pump NVMe connection just in case (e.g. Keepalives)
+//     spdk_nvme_qpair_process_completions(ctx->nvme_qpair, 0);
+    
+//     return 0;
+// }
+
 int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status) {
     uint32_t idx = ctx->cq_head % CQ_SIZE;
     volatile struct snic_completion *cump = &ctx->cq_buf[idx];
@@ -336,22 +434,25 @@ int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status)
     if (cump->status != 0) {
         *req_id = cump->req_id;
         *status = cump->status;
-        
-        // Clear slot for next wrap
+
+        struct iax_completion_record *cr = &ctx->comp_buf[idx];
+
+        printf("Completion Received! ID: %u, Status: %d\n", *req_id, *status);
+        dump_iax_cr(cr, idx);
+        dump_iax_cr_raw(cr, idx);
+
+        // Clear CQ slot for next wrap
         cump->status = 0;
-        
+
         // Advance Head
         ctx->cq_head++;
-        
-        // Optional: Trigger SPDK completions if needed to keep connection alive/heartbeats?
-        // spdk_nvme_qpair_process_completions(ctx->nvme_qpair, 0); 
 
         return 1; // Completed
     }
-    
-    // Pump NVMe connection just in case (e.g. Keepalives)
+
+    // Pump NVMe connection just in case
     spdk_nvme_qpair_process_completions(ctx->nvme_qpair, 0);
-    
+
     return 0;
 }
 
