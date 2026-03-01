@@ -21,6 +21,9 @@ int main(int argc, char *argv[]) {
     
     printf("Client Initialized. Mode: Async Ring Buffer.\n");
 
+    printf("Sleeping....\n");
+    sleep(5);
+
     // Applicaton Logic
     size_t size = 65536;
     void *buf = snic_client_alloc_buffer(ctx, size);
