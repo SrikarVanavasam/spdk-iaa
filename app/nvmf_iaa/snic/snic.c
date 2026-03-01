@@ -218,30 +218,62 @@ submit_iaa_async(int slot_idx) {
     // Clear Status Buffer for this slot
     memset(areq->status_buf, 0, 64);
 
-    // Populate Descriptor 
+    // // Populate Descriptor [IAA MEMMOVE]
+    // memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
+    // g_ctx.desc->opcode = IAX_OPCODE_MEMMOVE;
+    // g_ctx.desc->flags = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
+    
+    // uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
+    // g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset; 
+    
+    // // Staging Addr
+    // uint64_t scratch_addr = g_ctx.setup_info.scratch_base_addr + ((uint64_t)slot_idx * MAX_DATA_SIZE);
+
+    // if (areq->op == 1) {
+    //     g_ctx.desc->src1_addr = areq->src_addr;
+    //     g_ctx.desc->dst_addr = scratch_addr;
+    // } else {
+    //     g_ctx.desc->src1_addr = scratch_addr;
+    //     g_ctx.desc->dst_addr = areq->dst_addr;
+    // }
+
+    // g_ctx.desc->src1_size = areq->len;
+
+    // Populate Descriptor [IAA COMP]
     memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
-    g_ctx.desc->opcode = IAX_OPCODE_MEMMOVE;
-    g_ctx.desc->flags = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
-    
+
+    g_ctx.desc->opcode = IAX_OPCODE_COMPRESS;
+
+    /* round robin completion record */
+    g_ctx.desc->flags  = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
+
+    /* completion record per-slot */
     uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
-    g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset; 
-    
-    // Staging Addr
-    uint64_t scratch_addr = g_ctx.setup_info.scratch_base_addr + ((uint64_t)slot_idx * MAX_DATA_SIZE);
+    g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset;
 
-    if (areq->op == 1) {
-        g_ctx.desc->src1_addr = areq->src_addr;
-        g_ctx.desc->dst_addr = scratch_addr;
-    } else {
-        g_ctx.desc->src1_addr = scratch_addr;
-        g_ctx.desc->dst_addr = areq->dst_addr;
-    }
+    /* src1: input */
+    g_ctx.desc->src1_addr = areq->src_addr;     
+    g_ctx.desc->src1_size = areq->len;          
 
-    g_ctx.desc->src1_size = areq->len;
+    /* dst: compressed output */
+    uint64_t out_addr = g_ctx.setup_info.scratch_base_addr + ((uint64_t)slot_idx * MAX_DATA_SIZE);
+    g_ctx.desc->dst_addr     = out_addr;
+    g_ctx.desc->max_dst_size = MAX_DATA_SIZE;   
+
+    /* compress flags */
+    g_ctx.desc->compr_flags = 0;
+
+    /* skip src2, no ACES and dict */
+    g_ctx.desc->src2_addr = 0;
+    g_ctx.desc->src2_size = 0;
+
+    /* analytics 0 */
+    g_ctx.desc->filter_flags = 0;
+    g_ctx.desc->num_inputs   = 0;
 
     // Print IAA Descriptor
     dump_desc64(g_ctx.desc, "IAA_DESC_BEFORE_SUBMIT");
-    
+
     // Send Descriptor via RDMA Write (INLINE)
     sge.addr = (uintptr_t)g_ctx.desc;
     sge.length = sizeof(*g_ctx.desc);
@@ -414,8 +446,10 @@ check_messages(void *arg) {
     if (g_ctx.cm_id && g_ctx.cm_id->qp) {
         // 1. Check Messages
         if (ibv_poll_cq(g_ctx.cm_id->qp->recv_cq, 1, &wc) > 0) {
+            SPDK_NOTICELOG("Received IB Message in CQ.\n");
             rc = 1; // Busy
             if (wc.status == IBV_WC_SUCCESS) {
+                SPDK_NOTICELOG("Received IB Message in CQ with SUCCESS.\n");
                 // Process Message
                 if (!g_ctx.setup_done) {
                     // Expect SETUP Message
