@@ -25,7 +25,7 @@ int main(int argc, char *argv[]) {
     sleep(5);
 
     // Applicaton Logic
-    size_t size = 65536;
+    size_t size = 2 * 1024;
     void *buf = snic_client_alloc_buffer(ctx, size);
     if (!buf) die("alloc buffer");
     
