@@ -6,6 +6,7 @@
 #define SNIC_PORT 18515
 #define CQ_SIZE 16
 #define MAX_DATA_SIZE (2 * 1024 * 1024)
+#define AECS_SIZE 1568
 
 // Operation Codes
 #define SNIC_OP_WRITE 1
@@ -24,6 +25,7 @@ struct snic_setup_msg {
     uint64_t portal_addr;
     uint64_t cq_base_addr;
     uint64_t comp_base_addr;
+    uint64_t aecs_addr;          // [IAA_COMP_UPDATE]
     
     // 4-byte aligned members (20 bytes)
     uint32_t scratch_rkey;       // RKey for SNIC access
@@ -31,6 +33,7 @@ struct snic_setup_msg {
     uint32_t portal_rkey;
     uint32_t cq_rkey;
     uint32_t comp_rkey;
+    uint32_t aecs_size;          // [IAA_COMP_UPDATE]
     
     // 2-byte aligned members (4 bytes)
     uint16_t client_cntlid;

@@ -17,6 +17,7 @@
 
 #define DATA_SIZE (1024 * 1024)
 #define PORTAL_SIZE 4096
+#define AECS_SIZE 1568
 
 // Global arg holding for callback access (Prototype simplicity)
 static char *g_snic_ip = NULL;
@@ -46,6 +47,12 @@ struct snic_client_ctx {
     struct iax_completion_record *comp_buf;
     struct ibv_mr *mr_comp;
 
+    struct snic_setup_msg *setup_buf;
+    struct ibv_mr *mr_setup;
+
+    void *aecs_buf;              // [IAA_COMP_UPDATE]
+    size_t aecs_size;            // [IAA_COMP_UPDATE]
+
     // Ring Buffer Management
     uint64_t submission_idx; // Internal monotonic counter for Ring Slots
     uint32_t cq_head;
@@ -55,6 +62,24 @@ struct snic_client_ctx {
 static void die(const char *reason) {
   perror(reason);
   exit(EXIT_FAILURE);
+}
+
+static void load_exact_file(const char *path, void *buf, size_t len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die("fopen aecs.bin");
+
+    size_t n = fread(buf, 1, len, fp);
+    if (n != len) {
+        fprintf(stderr, "short read %s: got %zu want %zu\n", path, n, len);
+        exit(1);
+    }
+
+    if (fgetc(fp) != EOF) {
+        fprintf(stderr, "file %s longer than %zu bytes\n", path, len);
+        exit(1);
+    }
+
+    fclose(fp);
 }
 
 static const char *iax_status_str(uint8_t st) {
@@ -186,34 +211,36 @@ static int rdma_connect_snic(const char *ip, int port, struct snic_client_ctx *c
 }
 
 static int snic_send_setup(struct snic_client_ctx *ctx) {
-    struct snic_setup_msg msg = {};
+    struct snic_setup_msg *msg = ctx->setup_buf;
     struct ibv_sge sge;
     struct ibv_send_wr wr = {}, *bad_wr;
 
+    memset(msg, 0, sizeof(*msg));
+
     printf("[Init] Sending SETUP Message to SNIC...\n");
 
-    msg.scratch_base_addr = (uintptr_t)ctx->scratch_buf;
-    msg.scratch_rkey = ctx->mr_scratch->rkey;
-    msg.portal_addr = (uintptr_t)ctx->portal_buf;
-    msg.portal_rkey = ctx->mr_portal->rkey;
-    msg.cq_base_addr = (uintptr_t)ctx->cq_buf;
-    msg.cq_rkey = ctx->mr_cq->rkey;
-    msg.comp_base_addr = (uintptr_t)ctx->comp_buf;
-    msg.comp_rkey = ctx->mr_comp->rkey;
+    msg->scratch_base_addr = (uintptr_t)ctx->scratch_buf;
+    msg->scratch_rkey = ctx->mr_scratch->rkey;
+    msg->portal_addr = (uintptr_t)ctx->portal_buf;
+    msg->portal_rkey = ctx->mr_portal->rkey;
+    msg->cq_base_addr = (uintptr_t)ctx->cq_buf;
+    msg->cq_rkey = ctx->mr_cq->rkey;
+    msg->comp_base_addr = (uintptr_t)ctx->comp_buf;
+    msg->comp_rkey = ctx->mr_comp->rkey;
     
     // Extract CNTLID
     const struct spdk_nvme_ctrlr_data *cdata = spdk_nvme_ctrlr_get_data(ctx->ctrlr);
-    msg.client_cntlid = cdata->cntlid;
+    msg->client_cntlid = cdata->cntlid;
 
-    sge.addr = (uintptr_t)&msg;
-    sge.length = sizeof(msg);
-    sge.lkey = 0;
+    sge.addr = (uintptr_t)msg;
+    sge.length = sizeof(*msg);
+    sge.lkey = ctx->mr_setup->lkey;
 
     wr.wr_id = 9999;
     wr.opcode = IBV_WR_SEND;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    wr.send_flags = IBV_SEND_SIGNALED;
 
     if (ibv_post_send(ctx->qp, &wr, &bad_wr)) return -1;
 
@@ -226,6 +253,7 @@ static int snic_send_setup(struct snic_client_ctx *ctx) {
         return -1;
     }
     printf("[Init] SETUP Message Sent successfully.\n");
+    printf("sizeof(struct snic_setup_msg) = %zu\n", sizeof(struct snic_setup_msg));
     return 0;
 }
 
@@ -334,6 +362,25 @@ struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target
     if (fd < 0) die("open wq");
     ctx->portal_buf = mmap(NULL, PORTAL_SIZE, PROT_WRITE, MAP_SHARED, fd, 0);
     ctx->mr_portal = ibv_reg_mr(ctx->pd, ctx->portal_buf, PORTAL_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+
+    printf("[Init] Allocating AECS buffer\n");
+    ctx->aecs_size = AECS_SIZE;
+    if (posix_memalign(&ctx->aecs_buf, 64, ctx->aecs_size)) die("aecs alloc");
+    memset(ctx->aecs_buf, 0, ctx->aecs_size);
+    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/aecs.bin", ctx->aecs_buf, ctx->aecs_size);
+
+    printf("[Init] AECS loaded: addr=%p size=%zu\n", ctx->aecs_buf, ctx->aecs_size);
+
+    printf("[Init] Initing SETUP MSG...\n");
+    ctx->setup_buf = calloc(1, sizeof(struct snic_setup_msg));
+    if (!ctx->setup_buf) die("setup_buf");
+
+    ctx->mr_setup = ibv_reg_mr(ctx->pd,
+                            ctx->setup_buf,
+                            sizeof(struct snic_setup_msg),
+                            IBV_ACCESS_LOCAL_WRITE);
+    if (!ctx->mr_setup) die("ibv_reg_mr setup");
 
     ctx->submission_idx = 0;
     ctx->cq_head = 0;

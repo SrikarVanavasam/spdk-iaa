@@ -46,6 +46,10 @@ struct snic_async_req {
     uint64_t lba;
     uint64_t src_addr;
     uint64_t dst_addr;
+
+    // [IAA_COMP_UPDATE]
+    uint64_t aecs_addr;
+    uint32_t aecs_size;  
     
     // Buffer for RDMA Read of Completion Record
     uint8_t *status_buf;
@@ -56,8 +60,8 @@ struct snic_context {
     struct rdma_cm_id *listen_id;
     struct rdma_cm_id *cm_id;
     struct ibv_pd *pd;
-    struct ibv_mr *mr_req;
-    struct snic_request *req; // Recv buffer
+    // struct ibv_mr *mr_req;
+    // struct snic_request *req; // Recv buffer
     
     // IAA Resources
     struct iax_hw_desc *desc;
@@ -74,6 +78,10 @@ struct snic_context {
     // Client Setup Info
     bool setup_done;
     struct snic_setup_msg setup_info;
+
+    struct ibv_mr *mr_msg;
+    void *msg_buf;
+    size_t msg_buf_sz;
 
     // Async Request Pool
     struct snic_async_req active_reqs[CQ_SIZE];
@@ -218,62 +226,52 @@ submit_iaa_async(int slot_idx) {
     // Clear Status Buffer for this slot
     memset(areq->status_buf, 0, 64);
 
-    // // Populate Descriptor [IAA MEMMOVE]
-    // memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
-    // g_ctx.desc->opcode = IAX_OPCODE_MEMMOVE;
-    // g_ctx.desc->flags = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
-    
-    // uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
-    // g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset; 
-    
-    // // Staging Addr
-    // uint64_t scratch_addr = g_ctx.setup_info.scratch_base_addr + ((uint64_t)slot_idx * MAX_DATA_SIZE);
+    // Populate Descriptor 
+    #define IAX_COMP_FLAG_FLUSH_OUTPUT   0x0002
+    #define IAX_COMP_FLAG_END_PROCESSING 0x0004
 
-    // if (areq->op == 1) {
-    //     g_ctx.desc->src1_addr = areq->src_addr;
-    //     g_ctx.desc->dst_addr = scratch_addr;
-    // } else {
-    //     g_ctx.desc->src1_addr = scratch_addr;
-    //     g_ctx.desc->dst_addr = areq->dst_addr;
-    // }
-
-    // g_ctx.desc->src1_size = areq->len;
-
-    // Populate Descriptor [IAA COMP]
     memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
 
     g_ctx.desc->opcode = IAX_OPCODE_COMPRESS;
+    g_ctx.desc->flags  = IDXD_OP_FLAG_RCR |
+                        IDXD_OP_FLAG_CRAV |
+                        IDXD_OP_FLAG_RD_SRC2_AECS;
 
-    /* round robin completion record */
-    g_ctx.desc->flags  = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
-
-    /* completion record per-slot */
     uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
     g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset;
 
-    /* src1: input */
-    g_ctx.desc->src1_addr = areq->src_addr;     
-    g_ctx.desc->src1_size = areq->len;          
+    /* src1 */
+    g_ctx.desc->src1_addr = areq->src_addr;
+    g_ctx.desc->src1_size = areq->len;
 
-    /* dst: compressed output */
-    uint64_t out_addr = g_ctx.setup_info.scratch_base_addr + ((uint64_t)slot_idx * MAX_DATA_SIZE);
-    g_ctx.desc->dst_addr     = out_addr;
-    g_ctx.desc->max_dst_size = MAX_DATA_SIZE;   
+    /* dst */
+    uint64_t out_addr = g_ctx.setup_info.scratch_base_addr +
+                        ((uint64_t)slot_idx * MAX_DATA_SIZE);
+    g_ctx.desc->dst_addr = out_addr;
+    g_ctx.desc->max_dst_size = MAX_DATA_SIZE;
 
-    /* compress flags */
-    g_ctx.desc->compr_flags = 0;
+    /* compression flags */
+    g_ctx.desc->int_handle  = 0;
+    g_ctx.desc->compr_flags = IAX_COMP_FLAG_FLUSH_OUTPUT |
+                            IAX_COMP_FLAG_END_PROCESSING;
 
-    /* skip src2, no ACES and dict */
-    g_ctx.desc->src2_addr = 0;
-    g_ctx.desc->src2_size = 0;
+    /* src2 = AECS */
+    g_ctx.desc->src2_addr = areq->aecs_addr;
+    g_ctx.desc->src2_size = areq->aecs_size;
 
-    /* analytics 0 */
     g_ctx.desc->filter_flags = 0;
     g_ctx.desc->num_inputs   = 0;
 
     // Print IAA Descriptor
+    fprintf(stderr, "[IAA BUILD] slot=%d src1=%p len=%llu dst=%p aecs=%p aecs_size=%u\n",
+            slot_idx,
+            (void *)areq->src_addr,
+            (unsigned long long)areq->len,
+            (void *)(g_ctx.setup_info.scratch_base_addr + (uint64_t)slot_idx * MAX_DATA_SIZE),
+            (void *)areq->aecs_addr,
+            areq->aecs_size);
     dump_desc64(g_ctx.desc, "IAA_DESC_BEFORE_SUBMIT");
-
+    
     // Send Descriptor via RDMA Write (INLINE)
     sge.addr = (uintptr_t)g_ctx.desc;
     sge.length = sizeof(*g_ctx.desc);
@@ -311,9 +309,22 @@ on_connect_request(struct rdma_cm_id *id) {
     // Alloc PD
     g_ctx.pd = ibv_alloc_pd(id->verbs);
 
-    // Alloc Request Recv Buffer
-    g_ctx.req = spdk_dma_zmalloc(sizeof(*g_ctx.req), 64, NULL);
-    g_ctx.mr_req = ibv_reg_mr(g_ctx.pd, g_ctx.req, sizeof(*g_ctx.req), IBV_ACCESS_LOCAL_WRITE);
+    // Alloc Message Recv Buffer (must hold either SETUP or REQUEST)
+    g_ctx.msg_buf_sz = sizeof(struct snic_setup_msg) > sizeof(struct snic_request) ?
+                    sizeof(struct snic_setup_msg) : sizeof(struct snic_request);
+
+    g_ctx.msg_buf = spdk_dma_zmalloc(g_ctx.msg_buf_sz, 64, NULL);
+    if (!g_ctx.msg_buf) {
+        SPDK_ERRLOG("Failed to alloc msg_buf\n");
+        return -1;
+    }
+
+    g_ctx.mr_msg = ibv_reg_mr(g_ctx.pd, g_ctx.msg_buf, g_ctx.msg_buf_sz,
+                            IBV_ACCESS_LOCAL_WRITE);
+    if (!g_ctx.mr_msg) {
+        SPDK_ERRLOG("Failed to reg mr_msg\n");
+        return -1;
+    }
 
     // Alloc Descriptor Buffer
     g_ctx.desc = spdk_dma_zmalloc(sizeof(*g_ctx.desc), 64, NULL);
@@ -342,9 +353,9 @@ on_connect_request(struct rdma_cm_id *id) {
 
     // Post Recv for the Control Message
     struct ibv_sge sge = {
-        .addr = (uintptr_t)g_ctx.req,
-        .length = sizeof(*g_ctx.req),
-        .lkey = g_ctx.mr_req->lkey
+        .addr = (uintptr_t)g_ctx.msg_buf,
+        .length = g_ctx.msg_buf_sz,
+        .lkey = g_ctx.mr_msg->lkey
     };
     struct ibv_recv_wr wr = {
         .wr_id = 1,
@@ -358,32 +369,49 @@ on_connect_request(struct rdma_cm_id *id) {
     cm_params.initiator_depth = 1;
     cm_params.responder_resources = 1;
     rdma_accept(id, &cm_params);
-    
+    printf("sizeof(struct snic_request)   = %zu\n", sizeof(struct snic_request));
+    printf("sizeof(struct snic_setup_msg) = %zu\n", sizeof(struct snic_setup_msg));
+    printf("msg_buf_sz = %zu\n", g_ctx.msg_buf_sz);
     return 0;
 }
 
 static void
 process_request(void) {
-    uint32_t slot = g_ctx.req->slot_idx;
+    struct snic_request *req = (struct snic_request *)g_ctx.msg_buf;
+
+    uint32_t slot = req->slot_idx;
+    if (slot >= CQ_SIZE) {
+        SPDK_ERRLOG("Invalid slot_idx %u (CQ_SIZE=%u)\n", slot, CQ_SIZE);
+        return;
+    }
+
     struct snic_async_req *areq = &g_ctx.active_reqs[slot];
-    
-    // Populate Async Req from Global Recv Buffer
-    areq->req_id = g_ctx.req->req_id;
+
+    if (areq->state != REQ_FREE) {
+        SPDK_ERRLOG("Slot %u busy, state=%d, old req_id=%u, new req_id=%lu\n",
+                    slot, areq->state, areq->req_id, req->req_id);
+        return;
+    }
+
+    areq->req_id = req->req_id;
     areq->slot_idx = slot;
-    areq->op = g_ctx.req->op;
-    areq->len = g_ctx.req->len;
-    areq->lba = g_ctx.req->lba;
-    areq->src_addr = g_ctx.req->src_addr;
-    areq->dst_addr = g_ctx.req->dst_addr;
+    areq->op = req->op;
+    areq->len = req->len;
+    areq->lba = req->lba;
+    areq->src_addr = req->src_addr;
+    areq->dst_addr = req->dst_addr;
+
+    /* AECS comes from setup message, not per-request */
+    areq->aecs_addr = g_ctx.setup_info.aecs_addr;
+    areq->aecs_size = g_ctx.setup_info.aecs_size;
 
     if (areq->op == 1) {
-        // Async Submit
         submit_iaa_async(slot);
     } else if (areq->op == 2) {
-        // NVMe Read (Async)
-        submit_nvme_io(areq, 0); // 0 = Read 
+        submit_nvme_io(areq, 0); // 0 = Read
     } else {
         SPDK_ERRLOG("Unknown Opcode: %d\n", areq->op);
+        return;
     }
 }
 
@@ -442,35 +470,35 @@ static int
 check_messages(void *arg) {
     struct ibv_wc wc;
     int rc = 0;
+    struct snic_request *req = (struct snic_request *)g_ctx.msg_buf;
     // POLL RECV CQ (Client Messages)
     if (g_ctx.cm_id && g_ctx.cm_id->qp) {
         // 1. Check Messages
         if (ibv_poll_cq(g_ctx.cm_id->qp->recv_cq, 1, &wc) > 0) {
-            SPDK_NOTICELOG("Received IB Message in CQ.\n");
             rc = 1; // Busy
             if (wc.status == IBV_WC_SUCCESS) {
-                SPDK_NOTICELOG("Received IB Message in CQ with SUCCESS.\n");
                 // Process Message
                 if (!g_ctx.setup_done) {
-                    // Expect SETUP Message
                     if (wc.byte_len == sizeof(struct snic_setup_msg)) {
-                         memcpy(&g_ctx.setup_info, g_ctx.req, sizeof(struct snic_setup_msg));
-                         g_ctx.setup_done = true;
-                         SPDK_NOTICELOG("Received SETUP Message. Client QID: %d\n", g_ctx.setup_info.client_cntlid);
+                        memcpy(&g_ctx.setup_info, g_ctx.msg_buf, sizeof(struct snic_setup_msg));
+                        g_ctx.setup_done = true;
+                        SPDK_NOTICELOG("Received SETUP Message. Client QID: %d\n",
+                                    g_ctx.setup_info.client_cntlid);
                     } else {
-                         SPDK_ERRLOG("Expected SETUP msg (%lu bytes), got %d\n", sizeof(struct snic_setup_msg), wc.byte_len);
+                        SPDK_ERRLOG("Expected SETUP msg (%lu bytes), got %d\n",
+                                    sizeof(struct snic_setup_msg), wc.byte_len);
                     }
                 } else {
-                    // Expect REQUEST (Compact)
-                    SPDK_NOTICELOG("Got Request Op: %d, ID: %lu, Slot: %u\n", g_ctx.req->op, g_ctx.req->req_id, g_ctx.req->slot_idx);
+                    SPDK_NOTICELOG("Got Request Op: %d, ID: %lu, Slot: %u\n",
+                                req->op, req->req_id, req->slot_idx);
                     process_request();
                 }
 
                 // REPOST Recv WQE for next message
                 struct ibv_sge sge = {
-                    .addr = (uintptr_t)g_ctx.req,
-                    .length = sizeof(*g_ctx.req),
-                    .lkey = g_ctx.mr_req->lkey
+                    .addr = (uintptr_t)g_ctx.msg_buf,
+                    .length = g_ctx.msg_buf_sz,
+                    .lkey = g_ctx.mr_msg->lkey
                 };
                 struct ibv_recv_wr wr = {
                     .wr_id = 1,
