@@ -270,7 +270,6 @@ submit_iaa_async(int slot_idx) {
             (void *)(g_ctx.setup_info.scratch_base_addr + (uint64_t)slot_idx * MAX_DATA_SIZE),
             (void *)areq->aecs_addr,
             areq->aecs_size);
-
     dump_desc64(g_ctx.desc, "IAA_DESC_BEFORE_SUBMIT");
     
     // Send Descriptor via RDMA Write (INLINE)
