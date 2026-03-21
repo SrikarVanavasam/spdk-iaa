@@ -50,6 +50,10 @@ struct snic_async_req {
     // [IAA_COMP_UPDATE]
     uint64_t aecs_addr;
     uint32_t aecs_size;  
+
+    uint32_t orig_len;
+    uint32_t xfer_len;
+    uint32_t comp_len;
     
     // Buffer for RDMA Read of Completion Record
     uint8_t *status_buf;
@@ -89,6 +93,7 @@ struct snic_context {
 
 static struct snic_context g_ctx = {0};
 static char *g_trid_str = NULL;
+static uint32_t g_lba_comp_len[4096] = {0};
 
 // -----------------------------------------------------------------------------
 // Completion Logic
@@ -139,13 +144,12 @@ nvme_complete(void *arg, const struct spdk_nvme_cpl *cpl) {
         SPDK_ERRLOG("NVMe Command Failed!\n");
         submit_completion(-1, areq->req_id);
     } else {
-        if (areq->op == 1) {
-            // WRITE: Done
+        if (areq->op == SNIC_OP_WRITE) {
             submit_completion(0, areq->req_id);
             areq->state = REQ_FREE;
-        } else {
-            // READ: NVMe Done -> Decompress (submit_iaa_async)
-            submit_iaa_async(areq->slot_idx);
+        } else if (areq->op == SNIC_OP_READ) {
+            submit_completion(0, areq->req_id);
+            areq->state = REQ_FREE;
         }
     }
 }
@@ -162,14 +166,19 @@ submit_nvme_io(struct snic_async_req *areq, int r_w) {
     cmd.cdw11 = areq->lba >> 32;        // SLBA High
     
     uint32_t sector_size = spdk_nvme_ns_get_sector_size(g_ctx.ns);
-    uint32_t nlb = (areq->len + sector_size - 1) / sector_size;
-    cmd.cdw12 = nlb - 1;
+    // uint32_t nlb = (areq->len + sector_size - 1) / sector_size;
+    // cmd.cdw12 = nlb - 1;
 
     // STAGING OFFSET: Scratch Base + (SlotIdx * MAX_DATA_SIZE)
     uint64_t scratch_offset = (uint64_t)areq->slot_idx * MAX_DATA_SIZE;
 
+    uint32_t io_len = areq->xfer_len;
+    uint32_t nlb = (io_len + sector_size - 1) / sector_size;
+    cmd.cdw12 = nlb - 1;
+    cmd.dptr.sgl1.keyed.length = io_len;
+
     cmd.dptr.sgl1.address = g_ctx.setup_info.scratch_base_addr + scratch_offset;
-    cmd.dptr.sgl1.keyed.length = areq->len;
+    // cmd.dptr.sgl1.keyed.length = areq->len;
     cmd.dptr.sgl1.keyed.key = g_ctx.setup_info.scratch_rkey;
     cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
     cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
@@ -191,7 +200,7 @@ check_async_completions(void) {
             struct ibv_send_wr wr = {}, *bad_wr;
 
             sge.addr = (uintptr_t)areq->status_buf;
-            sge.length = 1;
+            sge.length = sizeof(struct iax_completion_record);
             sge.lkey = areq->mr_status->lkey;
 
             wr.wr_id = 2000 + i; // 2000 base for Read Status
@@ -405,10 +414,24 @@ process_request(void) {
     areq->aecs_addr = g_ctx.setup_info.aecs_addr;
     areq->aecs_size = g_ctx.setup_info.aecs_size;
 
-    if (areq->op == 1) {
+    areq->orig_len = req->len;
+    areq->xfer_len = req->len;   // default, write will change comp_len
+    areq->comp_len = 0;
+
+    if (req->op == SNIC_OP_WRITE) {
         submit_iaa_async(slot);
-    } else if (areq->op == 2) {
-        submit_nvme_io(areq, 0); // 0 = Read
+    } else if (req->op == SNIC_OP_READ) {
+        if (req->lba >= 4096 || g_lba_comp_len[req->lba] == 0) {
+            SPDK_ERRLOG("No comp_len metadata for LBA=%lu\n", req->lba);
+            submit_completion(-1, req->req_id);
+            areq->state = REQ_FREE;
+            return;
+        }
+
+        areq->comp_len = g_lba_comp_len[req->lba];
+        areq->xfer_len = areq->orig_len; // need to change later, round up acutal comp size with disk size
+        
+        submit_nvme_io(areq, 0);   // 0 = read
     } else {
         SPDK_ERRLOG("Unknown Opcode: %d\n", areq->op);
         return;
@@ -527,14 +550,35 @@ check_messages(void *arg) {
                 struct snic_async_req *areq = &g_ctx.active_reqs[slot];
                 
                 if (areq->state == REQ_IAA_READ_PENDING) {
-                    if (*(volatile uint8_t*)areq->status_buf != 0) {
-                        // DONE!
-                        // Handle Completion
-                        if (areq->op == 1) {
-                            // Write: IAA Done -> Submit NVMe
-                             submit_nvme_io(areq, 1); // 1 = Write
+                    // if (*(volatile uint8_t*)areq->status_buf != 0) {
+                    //     // DONE!
+                    //     // Handle Completion
+                    //     if (areq->op == 1) {
+                    //         // Write: IAA Done -> Submit NVMe
+                    //          submit_nvme_io(areq, 1); // 1 = Write
+                    //     } else {
+                    //         // Read: IAA (Decomp) Done -> Complete
+                    //         submit_completion(0, areq->req_id);
+                    //         areq->state = REQ_FREE;
+                    //     }
+                    // } else {
+                    //     // Not done, retry
+                    //     areq->state = REQ_IAA_POLLING; 
+                    // }
+                    struct iax_completion_record *cr =
+                        (struct iax_completion_record *)areq->status_buf;
+
+                    if (cr->status != 0) {
+                        if (areq->op == SNIC_OP_WRITE) {
+                            areq->comp_len = cr->output_size;
+                            areq->xfer_len = areq->orig_len; // need to change, round up with the disk size
+
+                            if (areq->lba < 4096) {
+                                g_lba_comp_len[areq->lba] = areq->comp_len;
+                            }
+
+                            submit_nvme_io(areq, 1);   // 1 = write
                         } else {
-                            // Read: IAA (Decomp) Done -> Complete
                             submit_completion(0, areq->req_id);
                             areq->state = REQ_FREE;
                         }
@@ -542,6 +586,7 @@ check_messages(void *arg) {
                         // Not done, retry
                         areq->state = REQ_IAA_POLLING; 
                     }
+
                 }
             }
         }
