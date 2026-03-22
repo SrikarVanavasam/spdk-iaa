@@ -20,26 +20,25 @@ struct snic_completion {
 
 // Setup/Config Message 
 struct snic_setup_msg {
-    // 8-byte aligned members (32 bytes)
     uint64_t scratch_base_addr;
     uint64_t portal_addr;
     uint64_t cq_base_addr;
     uint64_t comp_base_addr;
-    uint64_t aecs_addr;          // [IAA_COMP_UPDATE]
-    
-    // 4-byte aligned members (20 bytes)
-    uint32_t scratch_rkey;       // RKey for SNIC access
-    uint32_t scratch_target_rkey; // RKey for Target access (NVMe-oF)
+
+    uint64_t comp_aecs_addr;
+    uint64_t decomp_aecs_addr;
+
+    uint32_t scratch_rkey;
+    uint32_t scratch_target_rkey;
     uint32_t portal_rkey;
     uint32_t cq_rkey;
     uint32_t comp_rkey;
-    uint32_t aecs_size;          // [IAA_COMP_UPDATE]
-    
-    // 2-byte aligned members (4 bytes)
+
+    uint32_t comp_aecs_size;
+    uint32_t decomp_aecs_size;
+
     uint16_t client_cntlid;
-    
-    // Padding to 64 bytes (10 bytes)
-    uint8_t reserved[10]; 
+    uint8_t reserved[2];
 };
 
 // Compact Request Structure (<= 64 bytes)

@@ -50,8 +50,12 @@ struct snic_client_ctx {
     struct snic_setup_msg *setup_buf;
     struct ibv_mr *mr_setup;
 
-    void *aecs_buf;              // [IAA_COMP_UPDATE]
-    size_t aecs_size;            // [IAA_COMP_UPDATE]
+    void *comp_aecs_buf;
+    void *decomp_aecs_buf;
+    size_t comp_aecs_size;
+    size_t decomp_aecs_size;
+    struct ibv_mr *mr_comp_aecs;
+    struct ibv_mr *mr_decomp_aecs;
 
     // Ring Buffer Management
     uint64_t submission_idx; // Internal monotonic counter for Ring Slots
@@ -227,11 +231,16 @@ static int snic_send_setup(struct snic_client_ctx *ctx) {
     msg->cq_rkey = ctx->mr_cq->rkey;
     msg->comp_base_addr = (uintptr_t)ctx->comp_buf;
     msg->comp_rkey = ctx->mr_comp->rkey;
-    msg->aecs_addr = (uintptr_t)ctx->aecs_buf;
-    msg->aecs_size = (uint32_t)ctx->aecs_size;
 
-    printf("[SETUP] aecs_addr=%p aecs_size=%u\n",
-       (void *)msg->aecs_addr, msg->aecs_size);
+    msg->comp_aecs_addr   = (uintptr_t)ctx->comp_aecs_buf;
+    msg->comp_aecs_size   = (uint32_t)ctx->comp_aecs_size;
+    msg->decomp_aecs_addr = (uintptr_t)ctx->decomp_aecs_buf;
+    msg->decomp_aecs_size = (uint32_t)ctx->decomp_aecs_size;
+
+    printf("[SETUP] comp_aecs_addr=%p comp_aecs_size=%u\n",
+        (void *)msg->comp_aecs_addr, msg->comp_aecs_size);
+    printf("[SETUP] decomp_aecs_addr=%p decomp_aecs_size=%u\n",
+        (void *)msg->decomp_aecs_addr, msg->decomp_aecs_size);
 
     // Extract CNTLID
     const struct spdk_nvme_ctrlr_data *cdata = spdk_nvme_ctrlr_get_data(ctx->ctrlr);
@@ -369,13 +378,46 @@ struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target
     ctx->mr_portal = ibv_reg_mr(ctx->pd, ctx->portal_buf, PORTAL_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 
 
-    printf("[Init] Allocating AECS buffer\n");
-    ctx->aecs_size = AECS_SIZE;
-    if (posix_memalign(&ctx->aecs_buf, 64, ctx->aecs_size)) die("aecs alloc");
-    memset(ctx->aecs_buf, 0, ctx->aecs_size);
-    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/aecs.bin", ctx->aecs_buf, ctx->aecs_size);
+    printf("[Init] Allocating COMP/DECOMP AECS buffers\n");
 
-    printf("[Init] AECS loaded: addr=%p size=%zu\n", ctx->aecs_buf, ctx->aecs_size);
+    /*
+    * AECS should be allocated with 2x size because IAA uses double-buffered AECS.
+    * This matches the working standalone comp/decomp reference.
+    */
+    ctx->comp_aecs_size = 1568;
+    ctx->decomp_aecs_size = 5376;
+
+    if (posix_memalign(&ctx->comp_aecs_buf, 64, 2 * ctx->comp_aecs_size)) {
+        die("comp_aecs alloc");
+    }
+    if (posix_memalign(&ctx->decomp_aecs_buf, 64, 2 * ctx->decomp_aecs_size)) {
+        die("decomp_aecs alloc");
+    }
+
+    memset(ctx->comp_aecs_buf, 0, 2 * ctx->comp_aecs_size);
+    memset(ctx->decomp_aecs_buf, 0, 2 * ctx->decomp_aecs_size);
+
+    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/comp_aecs.bin",
+                    ctx->comp_aecs_buf, ctx->comp_aecs_size);
+    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/decomp_aecs.bin",
+                    ctx->decomp_aecs_buf, ctx->decomp_aecs_size);
+
+    printf("[Init] COMP AECS loaded:   addr=%p size=%zu\n",
+        ctx->comp_aecs_buf, ctx->comp_aecs_size);
+    printf("[Init] DECOMP AECS loaded: addr=%p size=%zu\n",
+        ctx->decomp_aecs_buf, ctx->decomp_aecs_size);
+
+    ctx->mr_comp_aecs = ibv_reg_mr(ctx->pd,
+                                ctx->comp_aecs_buf,
+                                2 * ctx->comp_aecs_size,
+                                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_comp_aecs) die("ibv_reg_mr comp_aecs");
+
+    ctx->mr_decomp_aecs = ibv_reg_mr(ctx->pd,
+                                    ctx->decomp_aecs_buf,
+                                    2 * ctx->decomp_aecs_size,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_decomp_aecs) die("ibv_reg_mr decomp_aecs");
 
     printf("[Init] Initing SETUP MSG...\n");
     ctx->setup_buf = calloc(1, sizeof(struct snic_setup_msg));
