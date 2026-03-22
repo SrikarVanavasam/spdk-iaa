@@ -17,6 +17,29 @@
 #include <stdio.h>
 #include <stdint.h>
 
+/* Missing in some idxd.h copies */
+#define IDXD_OP_FLAG_AECS_RW_TOGGLE      0x400000
+
+/* Compression flags */
+#define IAX_COMP_FLAG_STATS_MODE         0x0001
+#define IAX_COMP_FLAG_FLUSH_OUTPUT       0x0002
+#define IAX_COMP_FLAG_END_PROCESSING     0x0004
+#define IAX_COMP_FLAG_HDR_GEN(x)         ((uint16_t)(((x) & 0x7) << 12))
+
+/* Compression2 flags */
+#define IAX_COMP2_FLAG_MAKE_COMPLETE_TABLES      0x00000001
+#define IAX_COMP2_FLAG_WRITE_AECS_HUFFMAN_TABLES 0x00000002
+
+/* Decompression flags */
+#define IAX_DECOMP_FLAG_ENABLE_DECOMP      0x0001
+#define IAX_DECOMP_FLAG_FLUSH_OUTPUT       0x0002
+#define IAX_DECOMP_FLAG_STOP_ON_EOB        0x0004
+#define IAX_DECOMP_FLAG_CHECK_FOR_EOB      0x0008
+#define IAX_DECOMP_FLAG_SELECT_BFINAL_EOB  0x0010
+#define IAX_DECOMP_FLAG_DECOMP_BIT_ORDER   0x0020
+#define IAX_DECOMP_FLAG_SUPPRESS_OUTPUT    0x0200
+#define IAX_DECOMP_FLAG_LOAD_PARTIAL       0x2000
+
 static inline void dump_desc64(const void *desc, const char *tag)
 {
     const uint64_t *w = (const uint64_t *)desc;
@@ -36,6 +59,12 @@ enum snic_req_state {
     REQ_NVME_PENDING,       // NVMe Command Submitted
 };
 
+enum snic_iaa_phase {
+    IAA_PHASE_NONE = 0,
+    IAA_PHASE_COMPRESS,
+    IAA_PHASE_DECOMPRESS,
+};
+
 struct snic_async_req {
     enum snic_req_state state;
     uint32_t slot_idx;
@@ -48,12 +77,17 @@ struct snic_async_req {
     uint64_t dst_addr;
 
     // [IAA_COMP_UPDATE]
-    uint64_t aecs_addr;
-    uint32_t aecs_size;  
+    uint64_t comp_aecs_addr;
+    uint32_t comp_aecs_size;
+
+    uint64_t decomp_aecs_addr;
+    uint32_t decomp_aecs_size;
 
     uint32_t orig_len;
     uint32_t xfer_len;
     uint32_t comp_len;
+
+    int iaa_phase;
     
     // Buffer for RDMA Read of Completion Record
     uint8_t *status_buf;
@@ -94,6 +128,7 @@ struct snic_context {
 static struct snic_context g_ctx = {0};
 static char *g_trid_str = NULL;
 static uint32_t g_lba_comp_len[4096] = {0};
+static uint32_t g_lba_orig_len[4096] = {0};
 
 // -----------------------------------------------------------------------------
 // Completion Logic
@@ -137,20 +172,31 @@ static void submit_iaa_async(int slot_idx); // Forward Decl
 static void
 nvme_complete(void *arg, const struct spdk_nvme_cpl *cpl) {
     struct snic_async_req *areq = (struct snic_async_req *)arg;
-    
-    // SPDK_NOTICELOG("NVMe Complete for Req ID %u. Status: %s\n", areq->req_id, spdk_nvme_cpl_is_error(cpl) ? "FAIL" : "OK");
 
     if (spdk_nvme_cpl_is_error(cpl)) {
         SPDK_ERRLOG("NVMe Command Failed!\n");
         submit_completion(-1, areq->req_id);
+        areq->state = REQ_FREE;
+        return;
+    }
+
+    if (areq->op == SNIC_OP_WRITE) {
+        /*
+         * WRITE path already finished the NVMe write after compression.
+         */
+        submit_completion(0, areq->req_id);
+        areq->state = REQ_FREE;
+    } else if (areq->op == SNIC_OP_READ) {
+        /*
+         * READ path:
+         *   NVMe read has placed compressed data into scratch.
+         *   Now launch IAA decompression to copy/expand into user buffer.
+         */
+        areq->iaa_phase = IAA_PHASE_DECOMPRESS;
+        submit_iaa_async(areq->slot_idx);
     } else {
-        if (areq->op == SNIC_OP_WRITE) {
-            submit_completion(0, areq->req_id);
-            areq->state = REQ_FREE;
-        } else if (areq->op == SNIC_OP_READ) {
-            submit_completion(0, areq->req_id);
-            areq->state = REQ_FREE;
-        }
+        submit_completion(-1, areq->req_id);
+        areq->state = REQ_FREE;
     }
 }
 
@@ -226,66 +272,92 @@ static void
 submit_iaa_async(int slot_idx) {
     struct ibv_sge sge = {};
     struct ibv_send_wr wr = {}, *bad_wr;
-    
     struct snic_async_req *areq = &g_ctx.active_reqs[slot_idx];
 
-    // Status: REQ_IAA_SUBMITTED
+    uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
+    uint64_t scratch_addr = g_ctx.setup_info.scratch_base_addr +
+                            ((uint64_t)slot_idx * MAX_DATA_SIZE);
+
     areq->state = REQ_IAA_SUBMITTED;
-    
-    // Clear Status Buffer for this slot
     memset(areq->status_buf, 0, 64);
-
-    // Populate Descriptor 
-    #define IAX_COMP_FLAG_FLUSH_OUTPUT   0x0002
-    #define IAX_COMP_FLAG_END_PROCESSING 0x0004
-
     memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
 
-    g_ctx.desc->opcode = IAX_OPCODE_COMPRESS;
-    g_ctx.desc->flags  = IDXD_OP_FLAG_RCR |
+    g_ctx.desc->flags = IDXD_OP_FLAG_RCR |
                         IDXD_OP_FLAG_CRAV |
                         IDXD_OP_FLAG_RD_SRC2_AECS;
 
-    uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
     g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset;
-
-    /* src1 */
-    g_ctx.desc->src1_addr = areq->src_addr;
-    g_ctx.desc->src1_size = areq->len;
-
-    /* dst */
-    uint64_t out_addr = g_ctx.setup_info.scratch_base_addr +
-                        ((uint64_t)slot_idx * MAX_DATA_SIZE);
-    g_ctx.desc->dst_addr = out_addr;
-    g_ctx.desc->max_dst_size = MAX_DATA_SIZE;
-
-    /* compression flags */
-    g_ctx.desc->int_handle  = 0;
-    g_ctx.desc->compr_flags = IAX_COMP_FLAG_FLUSH_OUTPUT |
-                            IAX_COMP_FLAG_END_PROCESSING;
-
-    /* src2 = AECS */
-    g_ctx.desc->src2_addr = areq->aecs_addr;
-    g_ctx.desc->src2_size = areq->aecs_size;
-
+    g_ctx.desc->int_handle = 0;
     g_ctx.desc->filter_flags = 0;
-    g_ctx.desc->num_inputs   = 0;
+    g_ctx.desc->num_inputs = 0;
 
-    // Print IAA Descriptor
-    fprintf(stderr, "[IAA BUILD] slot=%d src1=%p len=%llu dst=%p aecs=%p aecs_size=%u\n",
-            slot_idx,
-            (void *)areq->src_addr,
-            (unsigned long long)areq->len,
-            (void *)(g_ctx.setup_info.scratch_base_addr + (uint64_t)slot_idx * MAX_DATA_SIZE),
-            (void *)areq->aecs_addr,
-            areq->aecs_size);
-    dump_desc64(g_ctx.desc, "IAA_DESC_BEFORE_SUBMIT");
-    
-    // Send Descriptor via RDMA Write (INLINE)
+    if (areq->iaa_phase == IAA_PHASE_COMPRESS) {
+        /*
+         * WRITE path:
+         * user buffer -> IAA compress -> scratch
+         */
+        g_ctx.desc->opcode = IAX_OPCODE_COMPRESS;
+
+        g_ctx.desc->src1_addr = areq->src_addr;
+        g_ctx.desc->src1_size = areq->orig_len;
+
+        g_ctx.desc->dst_addr = scratch_addr;
+        g_ctx.desc->max_dst_size = MAX_DATA_SIZE;
+
+        g_ctx.desc->compr_flags = IAX_COMP_FLAG_FLUSH_OUTPUT |
+                                  IAX_COMP_FLAG_END_PROCESSING;
+
+        g_ctx.desc->src2_addr = areq->comp_aecs_addr;
+        g_ctx.desc->src2_size = areq->comp_aecs_size;
+
+        dump_desc64(g_ctx.desc, "COMP_DESC");
+    } else if (areq->iaa_phase == IAA_PHASE_DECOMPRESS) {
+        /*
+         * READ path:
+         * scratch (compressed payload) -> IAA decompress -> user buffer
+         *
+         * Important:
+         *   - src1 is scratch
+         *   - src1_size is comp_len
+         *   - dst is the original user buffer
+         *   - max_dst_size is orig_len
+         *   - use DECOMPRESS opcode and decomp AECS
+         */
+        g_ctx.desc->opcode = IAX_OPCODE_DECOMPRESS;
+
+        g_ctx.desc->src1_addr = scratch_addr;
+        g_ctx.desc->src1_size = areq->comp_len;
+
+        g_ctx.desc->dst_addr = areq->dst_addr;
+        g_ctx.desc->max_dst_size = areq->orig_len;
+
+        /*
+         * The 16-bit field is named compr_flags in the struct,
+         * but for DECOMPRESS it carries decompression flags.
+         */
+        g_ctx.desc->compr_flags =
+            IAX_DECOMP_FLAG_ENABLE_DECOMP |
+            IAX_DECOMP_FLAG_FLUSH_OUTPUT  |
+            IAX_DECOMP_FLAG_STOP_ON_EOB   |
+            IAX_DECOMP_FLAG_CHECK_FOR_EOB |
+            IAX_DECOMP_FLAG_SELECT_BFINAL_EOB;
+
+        g_ctx.desc->src2_addr = areq->decomp_aecs_addr;
+        g_ctx.desc->src2_size = areq->decomp_aecs_size;
+
+        dump_desc64(g_ctx.desc, "DECOMP_DESC");
+    } else {
+        SPDK_ERRLOG("submit_iaa_async called with invalid iaa_phase=%d\n", areq->iaa_phase);
+        submit_completion(-1, areq->req_id);
+        areq->state = REQ_FREE;
+        return;
+    }
+
     sge.addr = (uintptr_t)g_ctx.desc;
     sge.length = sizeof(*g_ctx.desc);
-   
-    wr.wr_id = 1000 + slot_idx; // WR_ID used to track completion (1000 base)
+    sge.lkey = 0;
+
+    wr.wr_id = 1000 + slot_idx;
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.sg_list = &sge;
     wr.num_sge = 1;
@@ -293,12 +365,14 @@ submit_iaa_async(int slot_idx) {
     wr.wr.rdma.remote_addr = g_ctx.setup_info.portal_addr;
     wr.wr.rdma.rkey = g_ctx.setup_info.portal_rkey;
 
-    int rc = ibv_post_send(g_ctx.cm_id->qp, &wr, &bad_wr);
-    if (rc) {
-        SPDK_ERRLOG("Failed to post Async IAA Write: %d\n", rc);
+    if (ibv_post_send(g_ctx.cm_id->qp, &wr, &bad_wr)) {
+        SPDK_ERRLOG("Failed to post IAA descriptor for slot %d\n", slot_idx);
+        submit_completion(-1, areq->req_id);
         areq->state = REQ_FREE;
         return;
     }
+
+    areq->state = REQ_IAA_POLLING;
 }
 
 
@@ -402,39 +476,54 @@ process_request(void) {
         return;
     }
 
-    areq->req_id = req->req_id;
+    areq->req_id   = req->req_id;
     areq->slot_idx = slot;
-    areq->op = req->op;
-    areq->len = req->len;
-    areq->lba = req->lba;
+    areq->op       = req->op;
+    areq->len      = req->len;
+    areq->lba      = req->lba;
     areq->src_addr = req->src_addr;
     areq->dst_addr = req->dst_addr;
 
-    /* AECS comes from setup message, not per-request */
-    areq->aecs_addr = g_ctx.setup_info.aecs_addr;
-    areq->aecs_size = g_ctx.setup_info.aecs_size;
-
     areq->orig_len = req->len;
-    areq->xfer_len = req->len;   // default, write will change comp_len
+    areq->xfer_len = req->len;
     areq->comp_len = 0;
+    areq->iaa_phase = IAA_PHASE_NONE;
+
+    /* AECS buffers come from setup, not from the request itself */
+    areq->comp_aecs_addr   = g_ctx.setup_info.comp_aecs_addr;
+    areq->comp_aecs_size   = g_ctx.setup_info.comp_aecs_size;
+    areq->decomp_aecs_addr = g_ctx.setup_info.decomp_aecs_addr;
+    areq->decomp_aecs_size = g_ctx.setup_info.decomp_aecs_size;
+
+    memset(areq->status_buf, 0, 64);
 
     if (req->op == SNIC_OP_WRITE) {
+        areq->iaa_phase = IAA_PHASE_COMPRESS;
         submit_iaa_async(slot);
     } else if (req->op == SNIC_OP_READ) {
-        if (req->lba >= 4096 || g_lba_comp_len[req->lba] == 0) {
-            SPDK_ERRLOG("No comp_len metadata for LBA=%lu\n", req->lba);
+        if (req->lba >= 4096 || g_lba_comp_len[req->lba] == 0 || g_lba_orig_len[req->lba] == 0) {
+            SPDK_ERRLOG("Missing metadata for LBA=%lu\n", req->lba);
             submit_completion(-1, req->req_id);
             areq->state = REQ_FREE;
             return;
         }
 
+        /*
+         * comp_len is the valid compressed payload length.
+         * orig_len is the expected decompressed size.
+         *
+         * For now, NVMe I/O still uses block-sized transfer behavior.
+         * Keep xfer_len as orig_len, because that is what already works in your current path.
+         */
         areq->comp_len = g_lba_comp_len[req->lba];
-        areq->xfer_len = areq->orig_len; // need to change later, round up acutal comp size with disk size
-        
-        submit_nvme_io(areq, 0);   // 0 = read
+        areq->orig_len = g_lba_orig_len[req->lba];
+        areq->xfer_len = areq->orig_len;
+
+        submit_nvme_io(areq, 0);
     } else {
-        SPDK_ERRLOG("Unknown Opcode: %d\n", areq->op);
-        return;
+        SPDK_ERRLOG("Unknown op %d\n", req->op);
+        submit_completion(-1, req->req_id);
+        areq->state = REQ_FREE;
     }
 }
 
@@ -550,43 +639,48 @@ check_messages(void *arg) {
                 struct snic_async_req *areq = &g_ctx.active_reqs[slot];
                 
                 if (areq->state == REQ_IAA_READ_PENDING) {
-                    // if (*(volatile uint8_t*)areq->status_buf != 0) {
-                    //     // DONE!
-                    //     // Handle Completion
-                    //     if (areq->op == 1) {
-                    //         // Write: IAA Done -> Submit NVMe
-                    //          submit_nvme_io(areq, 1); // 1 = Write
-                    //     } else {
-                    //         // Read: IAA (Decomp) Done -> Complete
-                    //         submit_completion(0, areq->req_id);
-                    //         areq->state = REQ_FREE;
-                    //     }
-                    // } else {
-                    //     // Not done, retry
-                    //     areq->state = REQ_IAA_POLLING; 
-                    // }
                     struct iax_completion_record *cr =
                         (struct iax_completion_record *)areq->status_buf;
 
                     if (cr->status != 0) {
-                        if (areq->op == SNIC_OP_WRITE) {
+                        if (areq->iaa_phase == IAA_PHASE_COMPRESS) {
+                            /*
+                            * Compression finished.
+                            * Save metadata for later reads, then write scratch to NVMe.
+                            */
                             areq->comp_len = cr->output_size;
-                            areq->xfer_len = areq->orig_len; // need to change, round up with the disk size
 
                             if (areq->lba < 4096) {
                                 g_lba_comp_len[areq->lba] = areq->comp_len;
+                                g_lba_orig_len[areq->lba] = areq->orig_len;
                             }
 
-                            submit_nvme_io(areq, 1);   // 1 = write
-                        } else {
+                            /*
+                            * Keep the currently working block-I/O behavior.
+                            * The effective compressed payload length is comp_len,
+                            * but NVMe transfer length stays aligned to your current working path.
+                            */
+                            areq->xfer_len = areq->orig_len;
+
+                            submit_nvme_io(areq, 1);
+                        } else if (areq->iaa_phase == IAA_PHASE_DECOMPRESS) {
+                            /*
+                            * Decompression finished.
+                            * The user buffer should now contain the original data.
+                            */
                             submit_completion(0, areq->req_id);
+                            areq->state = REQ_FREE;
+                        } else {
+                            SPDK_ERRLOG("IAA completion with invalid phase=%d\n", areq->iaa_phase);
+                            submit_completion(-1, areq->req_id);
                             areq->state = REQ_FREE;
                         }
                     } else {
-                        // Not done, retry
-                        areq->state = REQ_IAA_POLLING; 
+                        /*
+                        * Hardware has not completed yet. Go back to polling.
+                        */
+                        areq->state = REQ_IAA_POLLING;
                     }
-
                 }
             }
         }

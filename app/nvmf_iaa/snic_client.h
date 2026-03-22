@@ -6,7 +6,14 @@
 #include "nvmf_iaa.h"
 
 // Forward declaration
-struct snic_client_ctx;
+struct snic_client_ctx {
+    void *comp_aecs_buf;
+    void *decomp_aecs_buf;
+    size_t comp_aecs_size;
+    size_t decomp_aecs_size;
+    struct ibv_mr *mr_comp_aecs;
+    struct ibv_mr *mr_decomp_aecs;
+};
 
 // Initialize connection to SNIC and Storage Target
 // wq_path: Path to IAA Work Queue (e.g., /dev/iax/wq1.0)
