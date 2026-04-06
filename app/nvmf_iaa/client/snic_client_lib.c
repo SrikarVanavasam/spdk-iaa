@@ -531,9 +531,9 @@ int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status)
 
         struct iax_completion_record *cr = &ctx->comp_buf[idx];
 
-        printf("Completion Received! ID: %u, Status: %d\n", *req_id, *status);
-        dump_iax_cr(cr, idx);
-        dump_iax_cr_raw(cr, idx);
+        // printf("Completion Received! ID: %u, Status: %d\n", *req_id, *status);
+        // dump_iax_cr(cr, idx);
+        // dump_iax_cr_raw(cr, idx);
 
         // Clear CQ slot for next wrap
         cump->status = 0;

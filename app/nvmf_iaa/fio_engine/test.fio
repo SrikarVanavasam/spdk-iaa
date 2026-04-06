@@ -1,0 +1,13 @@
+[global]
+ioengine=/home/xuanboj2/spdk-iaa/build/fio/spdk_nvme
+thread=1
+time_based=1
+direct=1
+iodepth=1
+
+bs=1k
+size=1k
+
+[rdma-test]
+rw=read
+filename=trtype=RDMA adrfam=IPv4 traddr=192.168.200.20 trsvcid=4420 subnqn=nqn.2016-06.io.spdk\:cnode1 ns=1

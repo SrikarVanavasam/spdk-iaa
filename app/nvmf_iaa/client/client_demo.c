@@ -149,6 +149,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../snic_client.h"
@@ -157,6 +158,17 @@
 static void die(const char *reason) {
     perror(reason);
     exit(EXIT_FAILURE);
+}
+
+static uint64_t timespec_diff_ns(const struct timespec *start,
+                                 const struct timespec *end)
+{
+    uint64_t start_ns = (uint64_t)start->tv_sec * 1000000000ULL +
+                        (uint64_t)start->tv_nsec;
+    uint64_t end_ns = (uint64_t)end->tv_sec * 1000000000ULL +
+                      (uint64_t)end->tv_nsec;
+
+    return end_ns - start_ns;
 }
 
 /* Helper: hex dump for debugging */
@@ -174,23 +186,22 @@ static void print_buf_hex(const void *buf, size_t len)
     }
 }
 
-/* Wait until a specific request ID completes */
-static int wait_for_req(struct snic_client_ctx *ctx, uint32_t expect_req)
+/* Wait until a specific request ID completes without printing in the hot path */
+static int wait_for_req(struct snic_client_ctx *ctx, uint32_t expect_req,
+                        uint32_t *completed_req)
 {
     while (1) {
         uint32_t cid = 0;
         int status = 0;
 
         if (snic_client_poll(ctx, &cid, &status)) {
-            printf("Completion Received! ID: %u, Status: %d\n", cid, status);
-
             if (cid == expect_req) {
+                if (completed_req) {
+                    *completed_req = cid;
+                }
                 return status;
             }
         }
-
-        /* Avoid spinning too aggressively */
-        usleep(1000);
     }
 }
 
@@ -212,16 +223,34 @@ static int compare_bytes(const void *a, const void *b, size_t len)
 
 int main(int argc, char *argv[])
 {
+    size_t size = 2 * 1024;
+    const char *wq_path = "/dev/iax/wq1.0";
+
     if (argc < 4) {
         fprintf(stderr,
-                "Usage: %s <snic_ip> <target_ip> <target_port> [iax_wq_path]\n",
+                "Usage: %s <snic_ip> <target_ip> <target_port> [size_kb] [iax_wq_path]\n",
                 argv[0]);
         return 1;
     }
 
+    if (argc > 4) {
+        char *end = NULL;
+        unsigned long parsed_kb = strtoul(argv[4], &end, 10);
+
+        if (end == argv[4] || *end != '\0' || parsed_kb < 1 || parsed_kb > 128) {
+            fprintf(stderr, "Invalid size_kb: %s (expected 1-128)\n", argv[4]);
+            return 1;
+        }
+
+        size = (size_t)parsed_kb * 1024;
+    }
+
+    if (argc > 5) {
+        wq_path = argv[5];
+    }
+
     struct snic_client_ctx *ctx =
-        snic_client_init(argv[1], argv[2], atoi(argv[3]),
-                         (argc > 4) ? argv[4] : "/dev/iax/wq1.0");
+        snic_client_init(argv[1], argv[2], atoi(argv[3]), wq_path);
     if (!ctx) {
         fprintf(stderr, "Failed to initialize client context\n");
         return 1;
@@ -230,10 +259,10 @@ int main(int argc, char *argv[])
     printf("Client Initialized. Mode: Async Ring Buffer.\n");
 
     printf("Sleeping....\n");
-    sleep(5);
+    sleep(2);
 
-    /* Application payload size */
-    size_t size = 2 * 1024;
+    printf("Application payload size: %zu KB (%zu bytes)\n",
+           size / 1024, size);
 
     /*
      * Allocate one DMA-capable user buffer.
@@ -256,40 +285,60 @@ int main(int argc, char *argv[])
     memset(orig, 0xAA, size);
     memcpy(buf, orig, size);
 
+    struct timespec write_start_ts = {0}, write_end_ts = {0};
+    struct timespec read_start_ts = {0}, read_end_ts = {0};
+    uint64_t write_latency_ns = 0;
+    uint64_t read_latency_ns = 0;
+    uint32_t write_cid = 0;
+    uint32_t read_cid = 0;
+
     /* ---------------- WRITE (compress path) ---------------- */
     uint32_t req1 = 101;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &write_start_ts) != 0) {
+        die("clock_gettime write_start");
+    }
     if (snic_client_write(ctx, buf, 2, size, req1) < 0) {
         fprintf(stderr, "Failed to submit write request\n");
         free(orig);
         return 1;
     }
-
-    printf("Submitted Req %u (Write+Compress). Waiting for completion...\n", req1);
-
-    if (wait_for_req(ctx, req1) < 0) {
+    if (wait_for_req(ctx, req1, &write_cid) < 0) {
         fprintf(stderr, "Write failed\n");
         free(orig);
         return 1;
     }
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &write_end_ts) != 0) {
+        die("clock_gettime write_end");
+    }
+    write_latency_ns = timespec_diff_ns(&write_start_ts, &write_end_ts);
 
     /* Clear destination buffer before issuing READ */
     memset(buf, 0x00, size);
 
     /* ---------------- READ (decompress path) ---------------- */
     uint32_t req2 = 102;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &read_start_ts) != 0) {
+        die("clock_gettime read_start");
+    }
     if (snic_client_read(ctx, buf, 2, size, req2) < 0) {
         fprintf(stderr, "Failed to submit read request\n");
         free(orig);
         return 1;
     }
-
-    printf("Submitted Req %u (Read+Decompress). Waiting for completion...\n", req2);
-
-    if (wait_for_req(ctx, req2) < 0) {
+    if (wait_for_req(ctx, req2, &read_cid) < 0) {
         fprintf(stderr, "Read failed\n");
         free(orig);
         return 1;
     }
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &read_end_ts) != 0) {
+        die("clock_gettime read_end");
+    }
+    read_latency_ns = timespec_diff_ns(&read_start_ts, &read_end_ts);
+
+    printf("Write E2E latency: %lu ns (%.3f us), req_id=%u\n",
+           write_latency_ns, (double)write_latency_ns / 1000.0, write_cid);
+    printf("Read  E2E latency: %lu ns (%.3f us), req_id=%u\n",
+           read_latency_ns, (double)read_latency_ns / 1000.0, read_cid);
 
     // /* ---------------- Final round-trip verify ---------------- */
     // if (compare_bytes(orig, buf, size) == 0) {
