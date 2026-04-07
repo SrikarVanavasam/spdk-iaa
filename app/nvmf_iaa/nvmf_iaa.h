@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define SNIC_PORT 18515
-#define CQ_SIZE 16
+#define CQ_SIZE 32
 #define MAX_DATA_SIZE (2 * 1024 * 1024)
 #define AECS_SIZE 1568
 

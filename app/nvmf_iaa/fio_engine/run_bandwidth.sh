@@ -8,16 +8,16 @@ PROJ_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HEADER_PATH="$PROJ_ROOT/nvmf_iaa.h"
 
 BS="${1:-128k}"
-RW="${RW:-write_read}"
+RW="${RW:-write}"
 CQ_SIZE_DEFAULT="$(awk '/#define[[:space:]]+CQ_SIZE[[:space:]]+[0-9]+/ { print $3; exit }' "$HEADER_PATH")"
 CQ_SIZE_DEFAULT="${CQ_SIZE_DEFAULT:-16}"
 
 if [[ -z "${TOTAL_IOS:-}" ]]; then
-  TOTAL_IOS=1
+  TOTAL_IOS=1024
 fi
 
-if [[ "$RW" != "write" && "$RW" != "read" && "$RW" != "write_read" ]]; then
-  echo "RW must be 'write', 'read', or 'write_read', got: $RW" >&2
+if [[ "$RW" != "write" && "$RW" != "read" ]]; then
+  echo "RW must be 'write' or 'read', got: $RW" >&2
   exit 1
 fi
 
@@ -41,7 +41,7 @@ esac
 
 SIZE="${2:-$((BS_BYTES * TOTAL_IOS))}"
 
-OUT_FILE="${OUT_FILE:-${BS}_latency.out}"
+OUT_FILE="${OUT_FILE:-${BS}_bandwidth.out}"
 
 SNIC_IP="${SNIC_IP:-192.168.200.11}"
 TARGET_IP="${TARGET_IP:-192.168.200.20}"
@@ -55,7 +55,7 @@ VERBOSE="${VERBOSE:-0}"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-JOB_FIO="$WORKDIR/single_phase.fio"
+JOB_FIO="$WORKDIR/bandwidth.fio"
 ENGINE_ABS="$(realpath "$ENGINE_PATH")"
 
 if [[ ! -f "$ENGINE_ABS" ]]; then
@@ -83,28 +83,12 @@ max_xfer_size=${MAX_XFER_SIZE}
 poll_usleep=${POLL_USLEEP}
 verbose=${VERBOSE}
 
-EOF
-
-if [[ "$RW" == "write_read" ]]; then
-cat >> "$JOB_FIO" <<EOF
-
-[write_phase]
-rw=write
-stonewall
-
-[read_phase]
-rw=read
-EOF
-else
-cat >> "$JOB_FIO" <<EOF
-
 [job]
 rw=${RW}
 EOF
-fi
 
 {
-  echo "=== run_latency.sh ==="
+  echo "=== run_bandwidth.sh ==="
   echo "timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "rw: ${RW}"
   echo "cq_size: ${CQ_SIZE_DEFAULT}"

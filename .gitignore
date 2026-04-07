@@ -12,6 +12,7 @@
 *.log
 *.o
 *.obj
+*.out
 *.pdb
 *.pyc
 *.so

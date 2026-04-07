@@ -18,6 +18,8 @@
 #define DATA_SIZE (1024 * 1024)
 #define PORTAL_SIZE 4096
 #define AECS_SIZE 1568
+#define COMP_AECS_SLOT_BYTES(size)   (2 * (size))
+#define DECOMP_AECS_SLOT_BYTES(size) (2 * (size))
 
 // Global arg holding for callback access (Prototype simplicity)
 static char *g_snic_ip = NULL;
@@ -315,10 +317,11 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target_ip, int target_port, const char *wq_path) {
     struct snic_client_ctx *ctx = calloc(1, sizeof(*ctx));
-    struct spdk_env_opts opts;
+    struct spdk_env_opts opts = {};
     g_snic_ip = (char*)snic_ip; // Save for callback
     
     spdk_env_opts_init(&opts);
+    opts.opts_size = sizeof(opts);
     opts.name = "snic_client";
     opts.shm_id = 0;
     if (spdk_env_init(&opts) < 0) {
@@ -387,20 +390,32 @@ struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target
     ctx->comp_aecs_size = 1568;
     ctx->decomp_aecs_size = 5376;
 
-    if (posix_memalign(&ctx->comp_aecs_buf, 64, 2 * ctx->comp_aecs_size)) {
+    size_t comp_aecs_slot_bytes = COMP_AECS_SLOT_BYTES(ctx->comp_aecs_size);
+    size_t decomp_aecs_slot_bytes = DECOMP_AECS_SLOT_BYTES(ctx->decomp_aecs_size);
+    size_t comp_aecs_total_bytes = CQ_SIZE * comp_aecs_slot_bytes;
+    size_t decomp_aecs_total_bytes = CQ_SIZE * decomp_aecs_slot_bytes;
+
+    if (posix_memalign(&ctx->comp_aecs_buf, 64, comp_aecs_total_bytes)) {
         die("comp_aecs alloc");
     }
-    if (posix_memalign(&ctx->decomp_aecs_buf, 64, 2 * ctx->decomp_aecs_size)) {
+    if (posix_memalign(&ctx->decomp_aecs_buf, 64, decomp_aecs_total_bytes)) {
         die("decomp_aecs alloc");
     }
 
-    memset(ctx->comp_aecs_buf, 0, 2 * ctx->comp_aecs_size);
-    memset(ctx->decomp_aecs_buf, 0, 2 * ctx->decomp_aecs_size);
+    memset(ctx->comp_aecs_buf, 0, comp_aecs_total_bytes);
+    memset(ctx->decomp_aecs_buf, 0, decomp_aecs_total_bytes);
 
-    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/comp_aecs.bin",
-                    ctx->comp_aecs_buf, ctx->comp_aecs_size);
-    load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/decomp_aecs.bin",
-                    ctx->decomp_aecs_buf, ctx->decomp_aecs_size);
+    for (uint32_t slot = 0; slot < CQ_SIZE; slot++) {
+        uint8_t *comp_slot_base = (uint8_t *)ctx->comp_aecs_buf +
+                                  (slot * comp_aecs_slot_bytes);
+        uint8_t *decomp_slot_base = (uint8_t *)ctx->decomp_aecs_buf +
+                                    (slot * decomp_aecs_slot_bytes);
+
+        load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/comp_aecs.bin",
+                        comp_slot_base, ctx->comp_aecs_size);
+        load_exact_file("/home/xuanboj2/spdk-iaa/app/nvmf_iaa/decomp_aecs.bin",
+                        decomp_slot_base, ctx->decomp_aecs_size);
+    }
 
     printf("[Init] COMP AECS loaded:   addr=%p size=%zu\n",
         ctx->comp_aecs_buf, ctx->comp_aecs_size);
@@ -409,13 +424,13 @@ struct snic_client_ctx *snic_client_init(const char *snic_ip, const char *target
 
     ctx->mr_comp_aecs = ibv_reg_mr(ctx->pd,
                                 ctx->comp_aecs_buf,
-                                2 * ctx->comp_aecs_size,
+                                comp_aecs_total_bytes,
                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_comp_aecs) die("ibv_reg_mr comp_aecs");
 
     ctx->mr_decomp_aecs = ibv_reg_mr(ctx->pd,
                                     ctx->decomp_aecs_buf,
-                                    2 * ctx->decomp_aecs_size,
+                                    decomp_aecs_total_bytes,
                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_decomp_aecs) die("ibv_reg_mr decomp_aecs");
 
@@ -449,6 +464,18 @@ void *snic_client_alloc_buffer(struct snic_client_ctx *ctx, size_t size) {
     return buf; 
 }
 
+static void reap_send_cq(struct snic_client_ctx *ctx)
+{
+    struct ibv_wc wc;
+
+    while (ibv_poll_cq(ctx->qp->send_cq, 1, &wc) > 0) {
+        if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "[Client SEND CQ] wr_id=%lu status=%d\n",
+                    wc.wr_id, wc.status);
+        }
+    }
+}
+
 // Internal Submit
 static int submit_req(struct snic_client_ctx *ctx, int op, void *buf, uint64_t lba, uint64_t len, uint32_t req_id) {
     struct snic_request req = {};
@@ -476,7 +503,15 @@ static int submit_req(struct snic_client_ctx *ctx, int op, void *buf, uint64_t l
     };
     struct ibv_send_wr *bad_wr;
 
-    ibv_post_send(ctx->qp, &wr, &bad_wr);
+    reap_send_cq(ctx);
+
+    if (ibv_post_send(ctx->qp, &wr, &bad_wr)) {
+        fprintf(stderr, "[Client SEND] ibv_post_send failed for req_id=%u slot=%u\n",
+                req.req_id, req.slot_idx);
+        return -1;
+    }
+
+    reap_send_cq(ctx);
     
     return req_id;
 }
@@ -530,6 +565,9 @@ int snic_client_poll(struct snic_client_ctx *ctx, uint32_t *req_id, int *status)
         *status = cump->status;
 
         struct iax_completion_record *cr = &ctx->comp_buf[idx];
+
+        // printf("[Client Poll] idx=%u req_id=%u status=%d cr_status=0x%x output_size=%u\n",
+        //        idx, *req_id, *status, cr->status, cr->output_size);
 
         // printf("Completion Received! ID: %u, Status: %d\n", *req_id, *status);
         // dump_iax_cr(cr, idx);

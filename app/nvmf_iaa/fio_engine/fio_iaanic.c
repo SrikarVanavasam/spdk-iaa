@@ -255,16 +255,17 @@ static int fio_snic_wait_req(struct thread_data *td, uint32_t expect_req_id,
         int status = 0;
 
         if (snic_client_poll(sd->ctx, &req_id, &status)) {
+            // fprintf(stderr,
+            //         "[fio wait] expect_req_id=%u got_req_id=%u status=%d\n",
+            //         expect_req_id, req_id, status);
             if (req_id == expect_req_id) {
                 *out_status = status;
                 return 0;
             }
 
-            if (o->verbose) {
-                fprintf(stderr,
-                        "ignoring completion req_id=%u while waiting for req_id=%u\n",
-                        req_id, expect_req_id);
-            }
+            // fprintf(stderr,
+            //         "[fio wait] ignoring completion req_id=%u while waiting for req_id=%u\n",
+            //         req_id, expect_req_id);
 
             continue;
         }

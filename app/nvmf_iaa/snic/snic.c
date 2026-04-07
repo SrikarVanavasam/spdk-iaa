@@ -39,6 +39,7 @@
 #define IAX_DECOMP_FLAG_DECOMP_BIT_ORDER   0x0020
 #define IAX_DECOMP_FLAG_SUPPRESS_OUTPUT    0x0200
 #define IAX_DECOMP_FLAG_LOAD_PARTIAL       0x2000
+#define AECS_SLOT_BYTES(size)              (2ULL * (uint64_t)(size))
 
 static inline void dump_desc64(const void *desc, const char *tag)
 {
@@ -88,6 +89,7 @@ struct snic_async_req {
     uint32_t comp_len;
 
     int iaa_phase;
+    bool status_read_outstanding;
     
     // Buffer for RDMA Read of Completion Record
     uint8_t *status_buf;
@@ -102,7 +104,7 @@ struct snic_context {
     // struct snic_request *req; // Recv buffer
     
     // IAA Resources
-    struct iax_hw_desc *desc;
+    struct iax_hw_desc *desc_pool;
     struct ibv_mr *mr_desc;
     
     // NVMe Resources
@@ -241,6 +243,10 @@ check_async_completions(void) {
         struct snic_async_req *areq = &g_ctx.active_reqs[i];
         
         if (areq->state == REQ_IAA_POLLING) {
+            if (areq->status_read_outstanding) {
+                continue;
+            }
+
             // Issue RDMA Read to check status
             struct ibv_sge sge = {};
             struct ibv_send_wr wr = {}, *bad_wr;
@@ -260,6 +266,9 @@ check_async_completions(void) {
             wr.wr.rdma.rkey = g_ctx.setup_info.comp_rkey;
 
             if (ibv_post_send(g_ctx.cm_id->qp, &wr, &bad_wr) == 0) {
+                 // SPDK_NOTICELOG("Posted status RDMA_READ for slot=%d req_id=%u\n",
+                 //                i, areq->req_id);
+                 areq->status_read_outstanding = true;
                  areq->state = REQ_IAA_READ_PENDING;
             } else {
                  SPDK_ERRLOG("Failed to post Status Read for slot %d\n", i);
@@ -273,44 +282,46 @@ submit_iaa_async(int slot_idx) {
     struct ibv_sge sge = {};
     struct ibv_send_wr wr = {}, *bad_wr;
     struct snic_async_req *areq = &g_ctx.active_reqs[slot_idx];
+    struct iax_hw_desc *desc = &g_ctx.desc_pool[slot_idx];
 
     uint64_t comp_offset = (uint64_t)slot_idx * sizeof(struct iax_completion_record);
     uint64_t scratch_addr = g_ctx.setup_info.scratch_base_addr +
                             ((uint64_t)slot_idx * MAX_DATA_SIZE);
 
     areq->state = REQ_IAA_SUBMITTED;
+    areq->status_read_outstanding = false;
     memset(areq->status_buf, 0, 64);
-    memset(g_ctx.desc, 0, sizeof(*g_ctx.desc));
+    memset(desc, 0, sizeof(*desc));
 
-    g_ctx.desc->flags = IDXD_OP_FLAG_RCR |
-                        IDXD_OP_FLAG_CRAV |
-                        IDXD_OP_FLAG_RD_SRC2_AECS;
+    desc->flags = IDXD_OP_FLAG_RCR |
+                  IDXD_OP_FLAG_CRAV |
+                  IDXD_OP_FLAG_RD_SRC2_AECS;
 
-    g_ctx.desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset;
-    g_ctx.desc->int_handle = 0;
-    g_ctx.desc->filter_flags = 0;
-    g_ctx.desc->num_inputs = 0;
+    desc->completion_addr = g_ctx.setup_info.comp_base_addr + comp_offset;
+    desc->int_handle = 0;
+    desc->filter_flags = 0;
+    desc->num_inputs = 0;
 
     if (areq->iaa_phase == IAA_PHASE_COMPRESS) {
         /*
          * WRITE path:
          * user buffer -> IAA compress -> scratch
          */
-        g_ctx.desc->opcode = IAX_OPCODE_COMPRESS;
+        desc->opcode = IAX_OPCODE_COMPRESS;
 
-        g_ctx.desc->src1_addr = areq->src_addr;
-        g_ctx.desc->src1_size = areq->orig_len;
+        desc->src1_addr = areq->src_addr;
+        desc->src1_size = areq->orig_len;
 
-        g_ctx.desc->dst_addr = scratch_addr;
-        g_ctx.desc->max_dst_size = MAX_DATA_SIZE;
+        desc->dst_addr = scratch_addr;
+        desc->max_dst_size = MAX_DATA_SIZE;
 
-        g_ctx.desc->compr_flags = IAX_COMP_FLAG_FLUSH_OUTPUT |
-                                  IAX_COMP_FLAG_END_PROCESSING;
+        desc->compr_flags = IAX_COMP_FLAG_FLUSH_OUTPUT |
+                            IAX_COMP_FLAG_END_PROCESSING;
 
-        g_ctx.desc->src2_addr = areq->comp_aecs_addr;
-        g_ctx.desc->src2_size = areq->comp_aecs_size;
+        desc->src2_addr = areq->comp_aecs_addr;
+        desc->src2_size = areq->comp_aecs_size;
 
-        // dump_desc64(g_ctx.desc, "COMP_DESC");
+        // dump_desc64(desc, "COMP_DESC");
     } else if (areq->iaa_phase == IAA_PHASE_DECOMPRESS) {
         /*
          * READ path:
@@ -323,29 +334,29 @@ submit_iaa_async(int slot_idx) {
          *   - max_dst_size is orig_len
          *   - use DECOMPRESS opcode and decomp AECS
          */
-        g_ctx.desc->opcode = IAX_OPCODE_DECOMPRESS;
+        desc->opcode = IAX_OPCODE_DECOMPRESS;
 
-        g_ctx.desc->src1_addr = scratch_addr;
-        g_ctx.desc->src1_size = areq->comp_len;
+        desc->src1_addr = scratch_addr;
+        desc->src1_size = areq->comp_len;
 
-        g_ctx.desc->dst_addr = areq->dst_addr;
-        g_ctx.desc->max_dst_size = areq->orig_len;
+        desc->dst_addr = areq->dst_addr;
+        desc->max_dst_size = areq->orig_len;
 
         /*
          * The 16-bit field is named compr_flags in the struct,
          * but for DECOMPRESS it carries decompression flags.
          */
-        g_ctx.desc->compr_flags =
+        desc->compr_flags =
             IAX_DECOMP_FLAG_ENABLE_DECOMP |
             IAX_DECOMP_FLAG_FLUSH_OUTPUT  |
             IAX_DECOMP_FLAG_STOP_ON_EOB   |
             IAX_DECOMP_FLAG_CHECK_FOR_EOB |
             IAX_DECOMP_FLAG_SELECT_BFINAL_EOB;
 
-        g_ctx.desc->src2_addr = areq->decomp_aecs_addr;
-        g_ctx.desc->src2_size = areq->decomp_aecs_size;
+        desc->src2_addr = areq->decomp_aecs_addr;
+        desc->src2_size = areq->decomp_aecs_size;
 
-        // dump_desc64(g_ctx.desc, "DECOMP_DESC");
+        // dump_desc64(desc, "DECOMP_DESC");
     } else {
         SPDK_ERRLOG("submit_iaa_async called with invalid iaa_phase=%d\n", areq->iaa_phase);
         submit_completion(-1, areq->req_id);
@@ -353,8 +364,8 @@ submit_iaa_async(int slot_idx) {
         return;
     }
 
-    sge.addr = (uintptr_t)g_ctx.desc;
-    sge.length = sizeof(*g_ctx.desc);
+    sge.addr = (uintptr_t)desc;
+    sge.length = sizeof(*desc);
     sge.lkey = 0;
 
     wr.wr_id = 1000 + slot_idx;
@@ -371,6 +382,9 @@ submit_iaa_async(int slot_idx) {
         areq->state = REQ_FREE;
         return;
     }
+
+    // SPDK_NOTICELOG("Posted IAA descriptor slot=%d req_id=%u wr_id=%lu phase=%d\n",
+    //                slot_idx, areq->req_id, wr.wr_id, areq->iaa_phase);
 
     areq->state = REQ_IAA_POLLING;
 }
@@ -432,7 +446,7 @@ on_connect_request(struct rdma_cm_id *id) {
     }
 
     // Alloc Descriptor Buffer
-    g_ctx.desc = spdk_dma_zmalloc(sizeof(*g_ctx.desc), 64, NULL);
+    g_ctx.desc_pool = spdk_dma_zmalloc(sizeof(*g_ctx.desc_pool) * CQ_SIZE, 64, NULL);
     // Inline send avoids MR registration
     g_ctx.mr_desc = NULL;
 
@@ -446,8 +460,8 @@ on_connect_request(struct rdma_cm_id *id) {
     }
 
     // Create QP
-    qp_attr.cap.max_send_wr = 32; // Increase Depth for Async!
-    qp_attr.cap.max_recv_wr = 32;
+    qp_attr.cap.max_send_wr = 256;
+    qp_attr.cap.max_recv_wr = 128;
     qp_attr.cap.max_send_sge = 1;
     qp_attr.cap.max_recv_sge = 1;
     qp_attr.cap.max_inline_data = 64; 
@@ -474,9 +488,9 @@ on_connect_request(struct rdma_cm_id *id) {
     cm_params.initiator_depth = 1;
     cm_params.responder_resources = 1;
     rdma_accept(id, &cm_params);
-    printf("sizeof(struct snic_request)   = %zu\n", sizeof(struct snic_request));
-    printf("sizeof(struct snic_setup_msg) = %zu\n", sizeof(struct snic_setup_msg));
-    printf("msg_buf_sz = %zu\n", g_ctx.msg_buf_sz);
+    // printf("sizeof(struct snic_request)   = %zu\n", sizeof(struct snic_request));
+    // printf("sizeof(struct snic_setup_msg) = %zu\n", sizeof(struct snic_setup_msg));
+    // printf("msg_buf_sz = %zu\n", g_ctx.msg_buf_sz);
     return 0;
 }
 
@@ -495,6 +509,7 @@ process_request(void) {
     if (areq->state != REQ_FREE) {
         SPDK_ERRLOG("Slot %u busy, state=%d, old req_id=%u, new req_id=%lu\n",
                     slot, areq->state, areq->req_id, req->req_id);
+        submit_completion(-1, req->req_id);
         return;
     }
 
@@ -510,11 +525,14 @@ process_request(void) {
     areq->xfer_len = req->len;
     areq->comp_len = 0;
     areq->iaa_phase = IAA_PHASE_NONE;
+    areq->status_read_outstanding = false;
 
     /* AECS buffers come from setup, not from the request itself */
-    areq->comp_aecs_addr   = g_ctx.setup_info.comp_aecs_addr;
+    areq->comp_aecs_addr   = g_ctx.setup_info.comp_aecs_addr +
+                             (slot * AECS_SLOT_BYTES(g_ctx.setup_info.comp_aecs_size));
     areq->comp_aecs_size   = g_ctx.setup_info.comp_aecs_size;
-    areq->decomp_aecs_addr = g_ctx.setup_info.decomp_aecs_addr;
+    areq->decomp_aecs_addr = g_ctx.setup_info.decomp_aecs_addr +
+                             (slot * AECS_SLOT_BYTES(g_ctx.setup_info.decomp_aecs_size));
     areq->decomp_aecs_size = g_ctx.setup_info.decomp_aecs_size;
 
     memset(areq->status_buf, 0, 64);
@@ -655,8 +673,8 @@ check_messages(void *arg) {
                                     sizeof(struct snic_setup_msg), wc.byte_len);
                     }
                 } else {
-                    SPDK_NOTICELOG("Got Request Op: %d, ID: %lu, Slot: %u\n",
-                                req->op, req->req_id, req->slot_idx);
+                    // SPDK_NOTICELOG("Got Request Op: %d, ID: %lu, Slot: %u\n",
+                    //             req->op, req->req_id, req->slot_idx);
                     process_request();
                 }
 
@@ -680,21 +698,29 @@ check_messages(void *arg) {
         
         // 2. Poll SEND CQ (Async Completions: WR_ID 1000+, 2000+)
         while (ibv_poll_cq(g_ctx.cm_id->qp->send_cq, 1, &wc) > 0) {
-            // SPDK_NOTICELOG("Send CQ Completion: WR_ID %lu\n", wc.wr_id);
+            // SPDK_NOTICELOG("Send CQ completion wr_id=%lu status=%d\n",
+            //                wc.wr_id, wc.status);
             if (wc.wr_id >= 1000 && wc.wr_id < 2000) {
                 // IAA Write Header Completed
                 uint32_t slot = wc.wr_id - 1000;
                 if (g_ctx.active_reqs[slot].state == REQ_IAA_SUBMITTED) {
+                     // SPDK_NOTICELOG("IAA descriptor send completed slot=%u req_id=%u\n",
+                     //                slot, g_ctx.active_reqs[slot].req_id);
                      g_ctx.active_reqs[slot].state = REQ_IAA_POLLING;
                 }
             } else if (wc.wr_id >= 2000 && wc.wr_id < 3000) {
                 // Status Read Completed
                 uint32_t slot = wc.wr_id - 2000;
                 struct snic_async_req *areq = &g_ctx.active_reqs[slot];
+                areq->status_read_outstanding = false;
                 
                 if (areq->state == REQ_IAA_READ_PENDING) {
                     struct iax_completion_record *cr =
                         (struct iax_completion_record *)areq->status_buf;
+
+                    // SPDK_NOTICELOG("Status RDMA_READ completed slot=%u req_id=%u cr->status=0x%x output_size=%u phase=%d\n",
+                    //                slot, areq->req_id, cr->status, cr->output_size,
+                    //                areq->iaa_phase);
 
                     if (cr->status != 0) {
                         if (areq->iaa_phase == IAA_PHASE_COMPRESS) {
