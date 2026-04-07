@@ -310,7 +310,7 @@ submit_iaa_async(int slot_idx) {
         g_ctx.desc->src2_addr = areq->comp_aecs_addr;
         g_ctx.desc->src2_size = areq->comp_aecs_size;
 
-        dump_desc64(g_ctx.desc, "COMP_DESC");
+        // dump_desc64(g_ctx.desc, "COMP_DESC");
     } else if (areq->iaa_phase == IAA_PHASE_DECOMPRESS) {
         /*
          * READ path:
@@ -345,7 +345,7 @@ submit_iaa_async(int slot_idx) {
         g_ctx.desc->src2_addr = areq->decomp_aecs_addr;
         g_ctx.desc->src2_size = areq->decomp_aecs_size;
 
-        dump_desc64(g_ctx.desc, "DECOMP_DESC");
+        // dump_desc64(g_ctx.desc, "DECOMP_DESC");
     } else {
         SPDK_ERRLOG("submit_iaa_async called with invalid iaa_phase=%d\n", areq->iaa_phase);
         submit_completion(-1, areq->req_id);
@@ -387,7 +387,29 @@ on_connect_request(struct rdma_cm_id *id) {
     int rc;
 
     SPDK_NOTICELOG("Received Connection Request from Host.\n");
+
+    /* Reset per-connection state before accepting a new host connection */
     g_ctx.cm_id = id;
+    g_ctx.setup_done = false;
+    g_ctx.cq_tail = 0;
+    memset(&g_ctx.setup_info, 0, sizeof(g_ctx.setup_info));
+
+    for (int i = 0; i < CQ_SIZE; i++) {
+        g_ctx.active_reqs[i].state = REQ_FREE;
+        g_ctx.active_reqs[i].slot_idx = i;
+        g_ctx.active_reqs[i].req_id = 0;
+        g_ctx.active_reqs[i].op = 0;
+        g_ctx.active_reqs[i].len = 0;
+        g_ctx.active_reqs[i].lba = 0;
+        g_ctx.active_reqs[i].src_addr = 0;
+        g_ctx.active_reqs[i].dst_addr = 0;
+        g_ctx.active_reqs[i].orig_len = 0;
+        g_ctx.active_reqs[i].xfer_len = 0;
+        g_ctx.active_reqs[i].comp_len = 0;
+        g_ctx.active_reqs[i].iaa_phase = IAA_PHASE_NONE;
+    }
+
+    // g_ctx.cm_id = id;
 
     // Alloc PD
     g_ctx.pd = ibv_alloc_pd(id->verbs);
@@ -533,9 +555,39 @@ on_connection(struct rdma_cm_id *id) {
     return 0;
 }
 
+// static int
+// on_disconnect(struct rdma_cm_id *id) {
+//     SPDK_NOTICELOG("Host Disconnected.\n");
+//     return 0;
+// }
+
 static int
 on_disconnect(struct rdma_cm_id *id) {
     SPDK_NOTICELOG("Host Disconnected.\n");
+
+    g_ctx.setup_done = false;
+    g_ctx.cq_tail = 0;
+    memset(&g_ctx.setup_info, 0, sizeof(g_ctx.setup_info));
+
+    if (g_ctx.cm_id == id) {
+        g_ctx.cm_id = NULL;
+    }
+
+    for (int i = 0; i < CQ_SIZE; i++) {
+        g_ctx.active_reqs[i].state = REQ_FREE;
+        g_ctx.active_reqs[i].req_id = 0;
+        g_ctx.active_reqs[i].op = 0;
+        g_ctx.active_reqs[i].len = 0;
+        g_ctx.active_reqs[i].lba = 0;
+        g_ctx.active_reqs[i].src_addr = 0;
+        g_ctx.active_reqs[i].dst_addr = 0;
+        g_ctx.active_reqs[i].orig_len = 0;
+        g_ctx.active_reqs[i].xfer_len = 0;
+        g_ctx.active_reqs[i].comp_len = 0;
+        g_ctx.active_reqs[i].iaa_phase = IAA_PHASE_NONE;
+        // memset(g_ctx.active_reqs[i].status_buf, 0, 64);
+    }
+
     return 0;
 }
 
@@ -589,6 +641,8 @@ check_messages(void *arg) {
         if (ibv_poll_cq(g_ctx.cm_id->qp->recv_cq, 1, &wc) > 0) {
             rc = 1; // Busy
             if (wc.status == IBV_WC_SUCCESS) {
+                SPDK_NOTICELOG("Recv CQE: byte_len=%u setup_done=%d\n",
+                                wc.byte_len, g_ctx.setup_done ? 1 : 0);
                 // Process Message
                 if (!g_ctx.setup_done) {
                     if (wc.byte_len == sizeof(struct snic_setup_msg)) {
