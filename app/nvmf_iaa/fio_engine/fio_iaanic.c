@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "fio.h"
@@ -30,8 +31,20 @@ struct fio_snic_data {
     struct snic_client_ctx *ctx;
     uint8_t *bounce;
     size_t bounce_size;
+};
+
+struct fio_snic_shared {
+    struct snic_client_ctx *ctx;
+    char snic_ip[64];
+    char target_ip[64];
+    char wq_path[256];
+    int target_port;
+    unsigned int refcnt;
     uint32_t next_req_id;
 };
+
+static struct fio_snic_shared g_shared = {0};
+static pthread_mutex_t g_shared_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct fio_option options[] = {
     {
@@ -98,7 +111,7 @@ static struct fio_option options[] = {
         .type     = FIO_OPT_INT,
         .off1     = offsetof(struct fio_snic_options, poll_usleep),
         .help     = "Sleep interval during synchronous completion polling",
-        .def      = "1000",
+        .def      = "0",
         .category = FIO_OPT_C_ENGINE,
         .group    = FIO_OPT_G_INVALID,
     },
@@ -125,6 +138,68 @@ static inline struct fio_snic_options *get_o(struct thread_data *td)
 static inline struct fio_snic_data *get_d(struct thread_data *td)
 {
     return td->io_ops_data;
+}
+
+static const char *safe_str(const char *s, const char *fallback)
+{
+    return s ? s : fallback;
+}
+
+static int fio_snic_shared_init(struct fio_snic_options *o,
+                                struct snic_client_ctx **out_ctx)
+{
+    const char *wq_path = safe_str(o->wq_path, "/dev/iax/wq1.0");
+    int rc = 0;
+
+    pthread_mutex_lock(&g_shared_lock);
+
+    if (g_shared.ctx) {
+        if (strcmp(g_shared.snic_ip, o->snic_ip) != 0 ||
+            strcmp(g_shared.target_ip, o->target_ip) != 0 ||
+            strcmp(g_shared.wq_path, wq_path) != 0 ||
+            g_shared.target_port != o->target_port) {
+            fprintf(stderr,
+                    "fio_snic_phase1: all jobs in one fio process must use the same SNIC/target config\n");
+            rc = -1;
+            goto out;
+        }
+
+        g_shared.refcnt++;
+        *out_ctx = g_shared.ctx;
+        goto out;
+    }
+
+    g_shared.ctx = snic_client_init(o->snic_ip, o->target_ip,
+                                    o->target_port, wq_path);
+    if (!g_shared.ctx) {
+        rc = -1;
+        goto out;
+    }
+
+    snprintf(g_shared.snic_ip, sizeof(g_shared.snic_ip), "%s", o->snic_ip);
+    snprintf(g_shared.target_ip, sizeof(g_shared.target_ip), "%s", o->target_ip);
+    snprintf(g_shared.wq_path, sizeof(g_shared.wq_path), "%s", wq_path);
+    g_shared.target_port = o->target_port;
+    g_shared.refcnt = 1;
+    g_shared.next_req_id = 1000;
+    *out_ctx = g_shared.ctx;
+
+out:
+    pthread_mutex_unlock(&g_shared_lock);
+    return rc;
+}
+
+static void fio_snic_shared_put(void)
+{
+    pthread_mutex_lock(&g_shared_lock);
+
+    if (g_shared.refcnt == 0) {
+        pthread_mutex_unlock(&g_shared_lock);
+        return;
+    }
+
+    g_shared.refcnt--;
+    pthread_mutex_unlock(&g_shared_lock);
 }
 
 static int fio_snic_open_file(struct thread_data fio_unused *td,
@@ -185,14 +260,17 @@ static int fio_snic_wait_req(struct thread_data *td, uint32_t expect_req_id,
                 return 0;
             }
 
-            fprintf(stderr, "unexpected completion req_id=%u expected=%u\n",
-                    req_id, expect_req_id);
-            *out_status = -1;
-            return -1;
+            if (o->verbose) {
+                fprintf(stderr,
+                        "ignoring completion req_id=%u while waiting for req_id=%u\n",
+                        req_id, expect_req_id);
+            }
+
+            continue;
         }
 
         spins++;
-        if ((spins % 5000) == 0) {
+        if (o->verbose && (spins % 5000) == 0) {
             fprintf(stderr, "waiting for req_id=%u\n", expect_req_id);
         }
 
@@ -216,7 +294,7 @@ static enum fio_q_status fio_snic_queue(struct thread_data *td, struct io_u *io_
         return FIO_Q_COMPLETED;
     }
 
-    req_id = ++sd->next_req_id;
+    req_id = __sync_add_and_fetch(&g_shared.next_req_id, 1);
 
     switch (io_u->ddir) {
     case DDIR_WRITE:
@@ -282,10 +360,7 @@ static int fio_snic_init(struct thread_data *td)
         return 1;
     }
 
-    sd->ctx = snic_client_init(o->snic_ip, o->target_ip,
-                               o->target_port,
-                               o->wq_path ? o->wq_path : "/dev/iax/wq1.0");
-    if (!sd->ctx) {
+    if (fio_snic_shared_init(o, &sd->ctx) != 0) {
         fprintf(stderr, "fio_snic_phase1: snic_client_init failed\n");
         free(sd);
         return 1;
@@ -300,7 +375,6 @@ static int fio_snic_init(struct thread_data *td)
         return 1;
     }
 
-    sd->next_req_id = 1000;
     td->io_ops_data = sd;
     return 0;
 }
@@ -315,9 +389,7 @@ static void fio_snic_cleanup(struct thread_data *td)
     if (sd->bounce)
         free(sd->bounce);
 
-    // if (sd->ctx)
-    //     snic_client_fini(sd->ctx);
-
+    fio_snic_shared_put();
     free(sd);
     td->io_ops_data = NULL;
 }
@@ -325,7 +397,7 @@ static void fio_snic_cleanup(struct thread_data *td)
 struct ioengine_ops ioengine = {
     .name               = "snic_phase1",
     .version            = FIO_IOOPS_VERSION,
-    .flags              = FIO_SYNCIO,
+    .flags              = FIO_SYNCIO | FIO_DISKLESSIO | FIO_NODISKUTIL | FIO_NOEXTEND,
 
     .init               = fio_snic_init,
     .prep               = fio_snic_prep,
