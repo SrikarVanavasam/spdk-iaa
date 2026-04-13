@@ -70,6 +70,7 @@ ioengine=external:${ENGINE_ABS}
 thread=1
 direct=1
 iodepth=1
+buffer_pattern=0x05
 
 bs=${BS}
 size=${SIZE}

@@ -40,6 +40,7 @@
 #define IAX_DECOMP_FLAG_SUPPRESS_OUTPUT    0x0200
 #define IAX_DECOMP_FLAG_LOAD_PARTIAL       0x2000
 #define AECS_SLOT_BYTES(size)              (2ULL * (uint64_t)(size))
+#define COMP_STATS_PRINT_EVERY             128
 
 static inline void dump_desc64(const void *desc, const char *tag)
 {
@@ -131,6 +132,48 @@ static struct snic_context g_ctx = {0};
 static char *g_trid_str = NULL;
 static uint32_t g_lba_comp_len[4096] = {0};
 static uint32_t g_lba_orig_len[4096] = {0};
+static uint64_t g_comp_stats_reqs = 0;
+static uint64_t g_comp_stats_orig_bytes = 0;
+static uint64_t g_comp_stats_comp_bytes = 0;
+
+static void
+reset_connection_state(void)
+{
+    g_ctx.setup_done = false;
+    g_ctx.cq_tail = 0;
+    memset(&g_ctx.setup_info, 0, sizeof(g_ctx.setup_info));
+    g_comp_stats_reqs = 0;
+    g_comp_stats_orig_bytes = 0;
+    g_comp_stats_comp_bytes = 0;
+
+    if (g_ctx.msg_buf && g_ctx.msg_buf_sz) {
+        memset(g_ctx.msg_buf, 0, g_ctx.msg_buf_sz);
+    }
+
+    for (int i = 0; i < CQ_SIZE; i++) {
+        g_ctx.active_reqs[i].state = REQ_FREE;
+        g_ctx.active_reqs[i].slot_idx = i;
+        g_ctx.active_reqs[i].req_id = 0;
+        g_ctx.active_reqs[i].op = 0;
+        g_ctx.active_reqs[i].len = 0;
+        g_ctx.active_reqs[i].lba = 0;
+        g_ctx.active_reqs[i].src_addr = 0;
+        g_ctx.active_reqs[i].dst_addr = 0;
+        g_ctx.active_reqs[i].comp_aecs_addr = 0;
+        g_ctx.active_reqs[i].comp_aecs_size = 0;
+        g_ctx.active_reqs[i].decomp_aecs_addr = 0;
+        g_ctx.active_reqs[i].decomp_aecs_size = 0;
+        g_ctx.active_reqs[i].orig_len = 0;
+        g_ctx.active_reqs[i].xfer_len = 0;
+        g_ctx.active_reqs[i].comp_len = 0;
+        g_ctx.active_reqs[i].iaa_phase = IAA_PHASE_NONE;
+        g_ctx.active_reqs[i].status_read_outstanding = false;
+
+        if (g_ctx.active_reqs[i].status_buf) {
+            memset(g_ctx.active_reqs[i].status_buf, 0, 64);
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Completion Logic
@@ -174,6 +217,12 @@ static void submit_iaa_async(int slot_idx); // Forward Decl
 static void
 nvme_complete(void *arg, const struct spdk_nvme_cpl *cpl) {
     struct snic_async_req *areq = (struct snic_async_req *)arg;
+
+    if (areq->op == SNIC_OP_READ) {
+        SPDK_NOTICELOG("READ nvme_complete: req_id=%u slot=%u phase=%d cdw0=0x%x status_type=0x%x status_code=0x%x\n",
+                       areq->req_id, areq->slot_idx, areq->iaa_phase,
+                       cpl->cdw0, cpl->status.sct, cpl->status.sc);
+    }
 
     if (spdk_nvme_cpl_is_error(cpl)) {
         SPDK_ERRLOG("NVMe Command Failed!\n");
@@ -231,6 +280,13 @@ submit_nvme_io(struct snic_async_req *areq, int r_w) {
     cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
     cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
     cmd.cdw15 = g_ctx.setup_info.client_cntlid;
+
+    if (r_w == 0) {
+        SPDK_NOTICELOG("READ submit_nvme_io: req_id=%u slot=%u lba=%lu comp_len=%u orig_len=%u xfer_len=%u scratch=0x%lx nlb=%u\n",
+                       areq->req_id, areq->slot_idx, areq->lba,
+                       areq->comp_len, areq->orig_len, areq->xfer_len,
+                       cmd.dptr.sgl1.address, nlb);
+    }
     
     rc = spdk_nvme_ctrlr_cmd_io_raw_with_md(g_ctx.ctrlr, g_ctx.qpair, &cmd, NULL, 0, NULL, nvme_complete, areq);
     if (rc) SPDK_ERRLOG("Failed to submit NVMe cmd: %d\n", rc);
@@ -402,28 +458,8 @@ on_connect_request(struct rdma_cm_id *id) {
 
     SPDK_NOTICELOG("Received Connection Request from Host.\n");
 
-    /* Reset per-connection state before accepting a new host connection */
     g_ctx.cm_id = id;
-    g_ctx.setup_done = false;
-    g_ctx.cq_tail = 0;
-    memset(&g_ctx.setup_info, 0, sizeof(g_ctx.setup_info));
-
-    for (int i = 0; i < CQ_SIZE; i++) {
-        g_ctx.active_reqs[i].state = REQ_FREE;
-        g_ctx.active_reqs[i].slot_idx = i;
-        g_ctx.active_reqs[i].req_id = 0;
-        g_ctx.active_reqs[i].op = 0;
-        g_ctx.active_reqs[i].len = 0;
-        g_ctx.active_reqs[i].lba = 0;
-        g_ctx.active_reqs[i].src_addr = 0;
-        g_ctx.active_reqs[i].dst_addr = 0;
-        g_ctx.active_reqs[i].orig_len = 0;
-        g_ctx.active_reqs[i].xfer_len = 0;
-        g_ctx.active_reqs[i].comp_len = 0;
-        g_ctx.active_reqs[i].iaa_phase = IAA_PHASE_NONE;
-    }
-
-    // g_ctx.cm_id = id;
+    reset_connection_state();
 
     // Alloc PD
     g_ctx.pd = ibv_alloc_pd(id->verbs);
@@ -559,6 +595,10 @@ process_request(void) {
         areq->orig_len = g_lba_orig_len[req->lba];
         areq->xfer_len = areq->orig_len;
 
+        SPDK_NOTICELOG("READ process_request: req_id=%lu slot=%u lba=%lu comp_len=%u orig_len=%u xfer_len=%u\n",
+                       req->req_id, slot, req->lba,
+                       areq->comp_len, areq->orig_len, areq->xfer_len);
+
         submit_nvme_io(areq, 0);
     } else {
         SPDK_ERRLOG("Unknown op %d\n", req->op);
@@ -583,28 +623,11 @@ static int
 on_disconnect(struct rdma_cm_id *id) {
     SPDK_NOTICELOG("Host Disconnected.\n");
 
-    g_ctx.setup_done = false;
-    g_ctx.cq_tail = 0;
-    memset(&g_ctx.setup_info, 0, sizeof(g_ctx.setup_info));
-
     if (g_ctx.cm_id == id) {
         g_ctx.cm_id = NULL;
     }
 
-    for (int i = 0; i < CQ_SIZE; i++) {
-        g_ctx.active_reqs[i].state = REQ_FREE;
-        g_ctx.active_reqs[i].req_id = 0;
-        g_ctx.active_reqs[i].op = 0;
-        g_ctx.active_reqs[i].len = 0;
-        g_ctx.active_reqs[i].lba = 0;
-        g_ctx.active_reqs[i].src_addr = 0;
-        g_ctx.active_reqs[i].dst_addr = 0;
-        g_ctx.active_reqs[i].orig_len = 0;
-        g_ctx.active_reqs[i].xfer_len = 0;
-        g_ctx.active_reqs[i].comp_len = 0;
-        g_ctx.active_reqs[i].iaa_phase = IAA_PHASE_NONE;
-        // memset(g_ctx.active_reqs[i].status_buf, 0, 64);
-    }
+    reset_connection_state();
 
     return 0;
 }
@@ -659,8 +682,8 @@ check_messages(void *arg) {
         if (ibv_poll_cq(g_ctx.cm_id->qp->recv_cq, 1, &wc) > 0) {
             rc = 1; // Busy
             if (wc.status == IBV_WC_SUCCESS) {
-                SPDK_NOTICELOG("Recv CQE: byte_len=%u setup_done=%d\n",
-                                wc.byte_len, g_ctx.setup_done ? 1 : 0);
+                // SPDK_NOTICELOG("Recv CQE: byte_len=%u setup_done=%d\n",
+                //                 wc.byte_len, g_ctx.setup_done ? 1 : 0);
                 // Process Message
                 if (!g_ctx.setup_done) {
                     if (wc.byte_len == sizeof(struct snic_setup_msg)) {
@@ -729,6 +752,21 @@ check_messages(void *arg) {
                             * Save metadata for later reads, then write scratch to NVMe.
                             */
                             areq->comp_len = cr->output_size;
+
+                            g_comp_stats_reqs++;
+                            g_comp_stats_orig_bytes += areq->orig_len;
+                            g_comp_stats_comp_bytes += areq->comp_len;
+
+                            if ((g_comp_stats_reqs % COMP_STATS_PRINT_EVERY) == 0) {
+                                SPDK_NOTICELOG("WRITE compress cumulative: reqs=%lu orig_bytes=%lu comp_bytes=%lu ratio=%.3f avg_comp_bytes=%.1f\n",
+                                               g_comp_stats_reqs,
+                                               g_comp_stats_orig_bytes,
+                                               g_comp_stats_comp_bytes,
+                                               g_comp_stats_orig_bytes ?
+                                                   ((double)g_comp_stats_comp_bytes / (double)g_comp_stats_orig_bytes) : 0.0,
+                                               g_comp_stats_reqs ?
+                                                   ((double)g_comp_stats_comp_bytes / (double)g_comp_stats_reqs) : 0.0);
+                            }
 
                             if (areq->lba < 4096) {
                                 g_lba_comp_len[areq->lba] = areq->comp_len;

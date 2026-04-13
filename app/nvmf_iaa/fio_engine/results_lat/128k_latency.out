@@ -1,14 +1,16 @@
 === run_latency.sh ===
-timestamp: 2026-04-06 19:40:24
+timestamp: 2026-04-07 22:41:46
+rw: write
+cq_size: 32
+total_ios: 32
 bs: 128k
-size: 128k
+size: 4194304
 fio: /home/xuanboj2/spdk-iaa/app/nvmf_iaa/fio/fio
-engine: ./iaanic.so
+engine: /home/xuanboj2/spdk-iaa/app/nvmf_iaa/fio_engine/iaanic.so
 poll_usleep: 0
-write_phase: (g=0): rw=write, bs=(R) 128KiB-128KiB, (W) 128KiB-128KiB, (T) 128KiB-128KiB, ioengine=snic_phase1, iodepth=1
-read_phase: (g=0): rw=read, bs=(R) 128KiB-128KiB, (W) 128KiB-128KiB, (T) 128KiB-128KiB, ioengine=snic_phase1, iodepth=1
+job: (g=0): rw=write, bs=(R) 128KiB-128KiB, (W) 128KiB-128KiB, (T) 128KiB-128KiB, ioengine=snic_phase1, iodepth=1
 fio-3.41-142-g698f
-Starting 2 threads
+Starting 1 thread
 EAL: '-c <coremask>' option is deprecated, and will be removed in a future release
 EAL: 	Use '-l <corelist>' or '--lcores=<corelist>' option instead
 [Init] Probing Target 192.168.200.20:4420...
@@ -23,51 +25,33 @@ EAL: 	Use '-l <corelist>' or '--lcores=<corelist>' option instead
 [Init] Cleaning IAA Completion Buffer
 [Init] Mapping IAA Portal at /dev/iax/wq1.0...
 [Init] Allocating COMP/DECOMP AECS buffers
-[Init] COMP AECS loaded:   addr=0x7d9484114040 size=1568
-[Init] DECOMP AECS loaded: addr=0x7d9484119140 size=5376
+[Init] COMP AECS loaded:   addr=0x7fb410119240 size=1568
+[Init] DECOMP AECS loaded: addr=0x7fb410131a80 size=5376
 [Init] Initing SETUP MSG...
-[Init] All systems OK. Staging Buffer: 32 MB (Hugepages)
+[Init] All systems OK. Staging Buffer: 64 MB (Hugepages)
 [Init] Sending SETUP Message to SNIC...
-[SETUP] comp_aecs_addr=0x7d9484114040 comp_aecs_size=1568
-[SETUP] decomp_aecs_addr=0x7d9484119140 decomp_aecs_size=5376
+[SETUP] comp_aecs_addr=0x7fb410119240 comp_aecs_size=1568
+[SETUP] decomp_aecs_addr=0x7fb410131a80 decomp_aecs_size=5376
 [Init] SETUP Message Sent successfully.
 sizeof(struct snic_setup_msg) = 80
 
-write_phase: (groupid=0, jobs=1): err= 0: pid=145054: Mon Apr  6 19:40:25 2026
-  write: IOPS=1000, BW=125MiB/s (131MB/s)(128KiB/1msec)
-    clat (nsec): min=287887, max=287887, avg=287887.00, stdev= 0.00
-     lat (nsec): min=291229, max=291229, avg=291229.00, stdev= 0.00
+job: (groupid=0, jobs=1): err= 0: pid=21504: Tue Apr  7 22:41:58 2026
+  write: IOPS=6400, BW=800MiB/s (839MB/s)(4096KiB/5msec)
+    clat (usec): min=138, max=260, avg=147.99, stdev=21.03
+     lat (usec): min=139, max=263, avg=149.84, stdev=21.30
     clat percentiles (usec):
-     |  1.00th=[  289],  5.00th=[  289], 10.00th=[  289], 20.00th=[  289],
-     | 30.00th=[  289], 40.00th=[  289], 50.00th=[  289], 60.00th=[  289],
-     | 70.00th=[  289], 80.00th=[  289], 90.00th=[  289], 95.00th=[  289],
-     | 99.00th=[  289], 99.50th=[  289], 99.90th=[  289], 99.95th=[  289],
-     | 99.99th=[  289]
-  lat (usec)   : 500=100.00%
-  cpu          : usr=0.00%, sys=0.00%, ctx=0, majf=0, minf=32
+     |  1.00th=[  139],  5.00th=[  139], 10.00th=[  141], 20.00th=[  141],
+     | 30.00th=[  143], 40.00th=[  143], 50.00th=[  145], 60.00th=[  145],
+     | 70.00th=[  147], 80.00th=[  147], 90.00th=[  153], 95.00th=[  159],
+     | 99.00th=[  262], 99.50th=[  262], 99.90th=[  262], 99.95th=[  262],
+     | 99.99th=[  262]
+  lat (usec)   : 250=96.88%, 500=3.12%
+  cpu          : usr=100.00%, sys=0.00%, ctx=0, majf=0, minf=32
   IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
      submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
      complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
-     issued rwts: total=0,1,0,0 short=0,0,0,0 dropped=0,0,0,0
-     latency   : target=0.00ns, window=0.00ns, percentile=100.00%, depth=1
-read_phase: (groupid=0, jobs=1): err= 0: pid=145055: Mon Apr  6 19:40:25 2026
-  read: IOPS=1000, BW=125MiB/s (131MB/s)(128KiB/1msec)
-    clat (nsec): min=405032, max=405032, avg=405032.00, stdev= 0.00
-     lat (nsec): min=406047, max=406047, avg=406047.00, stdev= 0.00
-    clat percentiles (usec):
-     |  1.00th=[  404],  5.00th=[  404], 10.00th=[  404], 20.00th=[  404],
-     | 30.00th=[  404], 40.00th=[  404], 50.00th=[  404], 60.00th=[  404],
-     | 70.00th=[  404], 80.00th=[  404], 90.00th=[  404], 95.00th=[  404],
-     | 99.00th=[  404], 99.50th=[  404], 99.90th=[  404], 99.95th=[  404],
-     | 99.99th=[  404]
-  lat (usec)   : 500=100.00%
-  cpu          : usr=0.00%, sys=0.00%, ctx=0, majf=0, minf=66
-  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
-     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
-     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
-     issued rwts: total=1,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     issued rwts: total=0,32,0,0 short=0,0,0,0 dropped=0,0,0,0
      latency   : target=0.00ns, window=0.00ns, percentile=100.00%, depth=1
 
 Run status group 0 (all jobs):
-   READ: bw=125MiB/s (131MB/s), 125MiB/s-125MiB/s (131MB/s-131MB/s), io=128KiB (131kB), run=1-1msec
-  WRITE: bw=125MiB/s (131MB/s), 125MiB/s-125MiB/s (131MB/s-131MB/s), io=128KiB (131kB), run=1-1msec
+  WRITE: bw=800MiB/s (839MB/s), 800MiB/s-800MiB/s (839MB/s-839MB/s), io=4096KiB (4194kB), run=5-5msec

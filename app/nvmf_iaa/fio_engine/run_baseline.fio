@@ -1,12 +1,16 @@
 [global]
 ioengine=/home/xuanboj2/spdk-iaa/build/fio/spdk_nvme
 thread=1
-time_based=1
 direct=1
+group_reporting=1
+time_based=1
+runtime=30
+ramp_time=3
 iodepth=1
 
-bs=1k
-size=1k
+# This engine is synchronous, so bandwidth scaling comes from larger block sizes.
+bs=128k
+size=128m
 
 [rdma-test]
 rw=read

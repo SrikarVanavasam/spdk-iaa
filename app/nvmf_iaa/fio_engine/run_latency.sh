@@ -13,7 +13,7 @@ CQ_SIZE_DEFAULT="$(awk '/#define[[:space:]]+CQ_SIZE[[:space:]]+[0-9]+/ { print $
 CQ_SIZE_DEFAULT="${CQ_SIZE_DEFAULT:-16}"
 
 if [[ -z "${TOTAL_IOS:-}" ]]; then
-  TOTAL_IOS=1
+  TOTAL_IOS=32
 fi
 
 if [[ "$RW" != "write" && "$RW" != "read" && "$RW" != "write_read" ]]; then
@@ -70,6 +70,7 @@ ioengine=external:${ENGINE_ABS}
 thread=1
 direct=1
 iodepth=1
+buffer_pattern=0x05
 
 bs=${BS}
 size=${SIZE}
